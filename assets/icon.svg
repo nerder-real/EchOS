@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <!-- 橙色底，上浅下深更有立体感；整幅全出血，DMG 卷标用 -->
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFAA1E"/><stop offset="1" stop-color="#F07805"/>
+    </linearGradient>
+    <!-- 白色云朵，上纯白下微灰 -->
+    <linearGradient id="cloud" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF"/><stop offset="1" stop-color="#F7F7F8"/>
+    </linearGradient>
+    <filter id="s" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="16" stdDeviation="20" flood-color="#7A3B00" flood-opacity="0.28"/>
+    </filter>
+  </defs>
+  <rect x="0" y="0" width="1024" height="1024" fill="url(#bg)"/>
+  <g filter="url(#s)">
+    <path fill="url(#cloud)" d="
+      M 666.35 470.84
+      C 652.07 398.39 588.44 344 512 344
+      C 451.31 344 398.60 378.44 372.35 428.84
+      C 309.14 435.56 260 489.11 260 554
+      C 260 623.51 316.49 680 386 680
+      L 659 680
+      C 716.96 680 764 632.96 764 575
+      C 764 519.56 720.95 474.62 666.35 470.84
+      Z"/>
+  </g>
+</svg>

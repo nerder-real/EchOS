@@ -1,0 +1,26 @@
+# Build output
+build/
+
+# 本地打包的成品 DMG（根目录，make-dmg.sh 输出；仓库用 GitHub Actions 发版）
+EchOS-mac-*.dmg
+
+# 内核编译产物（build.sh 只在 build/ 里产出；直接 go build 会落在 core/）
+core/x-tunnel
+core/x-tunnel-*
+core/*.test
+
+# macOS
+.DS_Store
+
+# Xcode / Swift
+*.xcuserstate
+DerivedData/
+
+# 分流规则数据（24MB 二进制，来自上游开源项目，构建前用 fetch-geodata.sh 下载）
+assets/geoip.dat
+assets/geosite.dat
+
+# 用户配置与日志（运行时生成在用户目录，兜底忽略）
+config.json
+logs/
+*.log
