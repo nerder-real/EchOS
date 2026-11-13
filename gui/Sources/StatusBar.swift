@@ -196,6 +196,10 @@ final class StatusBarController: NSObject, NSMenuDelegate {
     }
 
     @objc private func toggleProxy() {
+        // 菜单动作在跟踪会话内执行：await 链（授权校验网络往返 + 停止内核
+        // 2~6s + 系统代理还原）期间面板会挂着不消失、还带全程延迟（2026-11-14
+        // 用户实测）。动作开头立刻取消跟踪让面板先收起，实际工作转后台。
+        statusItem?.menu?.cancelTracking()
         Task { @MainActor in
             guard let state else { return }
             // 开关代理前先 force 校验（对齐 Win tray_service：托盘 ECH 代理
@@ -209,6 +213,7 @@ final class StatusBarController: NSObject, NSMenuDelegate {
     }
 
     @objc private func toggleTunMode() {
+        statusItem?.menu?.cancelTracking()  // 面板先收起（同 toggleProxy：动作含长 await 链）
         guard let state else { return }
         // 动作级第二道闸：与菜单缩减同一把锁（uiLocked）
         if LicenseService.shared.uiLocked {
@@ -232,6 +237,7 @@ final class StatusBarController: NSObject, NSMenuDelegate {
     }
 
     @objc private func pickServer(_ sender: NSMenuItem) {
+        statusItem?.menu?.cancelTracking()  // 切服务器会重启代理（2~6s），面板先收起
         guard let id = sender.representedObject as? UUID else { return }
         // 运行中切换服务器会重启代理换到新服务器生效——同样受授权门禁，
         // 界面被锁时点击落空并亮出激活窗口
@@ -244,6 +250,7 @@ final class StatusBarController: NSObject, NSMenuDelegate {
 
     /// 菜单栏的「检查更新」：同时检查软件新版本和分流数据
     @objc private func checkUpdate() {
+        statusItem?.menu?.cancelTracking()  // 检查更新含网络往返，面板先收起
         if LicenseService.shared.uiLocked {
             showApp()
             return
