@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- App 图标母版（gui/icon-master-1024.png 由本文件渲染生成，refresh-icon.sh 出 icns）。
+       按 Apple macOS 图标规范留白：圆角方块 824×824 居中于 1024 画布（四周各留 100），
+       圆角半径 185 ≈ Apple 大圆角方胚。之前内容顶满画布，Dock 里显得撑爆、像被裁掉一角。
+       云朵几何对齐 Win 端图标（更宽更扁），阴影调柔（Win 同款轻微投影，不再是灰边一团）。 -->
+  <defs>
+    <!-- 橙色底，上浅下深；与菜单栏品牌色同源 -->
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFAA1E"/><stop offset="1" stop-color="#F07805"/>
+    </linearGradient>
+    <!-- 白色云朵，上纯白下微灰 -->
+    <linearGradient id="cloud" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF"/><stop offset="1" stop-color="#F7F7F8"/>
+    </linearGradient>
+    <filter id="s" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="6" stdDeviation="10" flood-color="#7A3B00" flood-opacity="0.18"/>
+    </filter>
+  </defs>
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#bg)"/>
+  <g filter="url(#s)">
+    <g transform="translate(512 512) scale(1.14) translate(-512 -512)">
+      <path fill="url(#cloud)" d="
+        M 666.35 470.84
+        C 652.07 398.39 588.44 344 512 344
+        C 451.31 344 398.60 378.44 372.35 428.84
+        C 309.14 435.56 260 489.11 260 554
+        C 260 623.51 316.49 680 386 680
+        L 659 680
+        C 716.96 680 764 632.96 764 575
+        C 764 519.56 720.95 474.62 666.35 470.84
+        Z"/>
+    </g>
+  </g>
+</svg>

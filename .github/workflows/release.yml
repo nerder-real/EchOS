@@ -1,0 +1,134 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '发布版本号，例如 1.0.0（会用 v1.0.0 作为 Release 标签）'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build DMG
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          # 用 go.mod 声明的版本（当前 1.25.5），不用 'stable'：
+          # runner 上 stable 漂移可能导致本地能编的语法/依赖在 CI 编不过
+          go-version-file: core/go.mod
+          cache-dependency-path: core/go.sum
+
+      # 版本号：push 标签时取 GITHUB_REF_NAME（v1.0.0 → 1.0.0）；
+      # 手动触发时取输入框版本号（1.0.0 → 标签 v1.0.0）。
+      # 写回 Info.plist，DMG 文件名自动是 EchOS-mac-1.0.0-universal-x64.dmg。
+      - name: Resolve version
+        id: ver
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            TAG="${GITHUB_REF_NAME}"
+            VER="${GITHUB_REF_NAME#v}"
+          else
+            TAG="v${{ github.event.inputs.version }}"
+            VER="${{ github.event.inputs.version }}"
+          fi
+          echo "TAG=$TAG" >> "$GITHUB_OUTPUT"
+          echo "VER=$VER" >> "$GITHUB_OUTPUT"
+          echo "Building version: $VER"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VER" gui/Info.plist
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VER" gui/Info.plist
+
+      - name: Fetch geo data
+        # geoip.dat / geosite.dat 不进仓库，构建前下载最新版（本地已存在则跳过）。
+        # 上游 GitHub releases 偶发 5xx/限流，重试三次；仍失败则明确报错。
+        run: |
+          for i in 1 2 3; do
+            ./fetch-geodata.sh && break
+            echo "::warning::fetch-geodata.sh 第 $i 次失败，5 秒后重试"
+            sleep 5
+          done
+          test -s assets/geoip.dat && test -s assets/geosite.dat
+
+      - name: Verify kernel compiles
+        # 单独先编译内核：Swift 侧出错时也能立刻分辨是哪个语言的问题，
+        # 并且能在打 DMG（慢）之前快速失败。
+        run: |
+          cd core
+          go vet ./...
+          CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -o /dev/null .
+          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -o /dev/null .
+
+      - name: Build app
+        # ECH_UPDATE_REPO 注入更新源；ECH_LICENSE_URL 从 Actions secret 注入
+        # （secret 名固定，值在仓库设置里配置）。正式 tag 构建缺失该 secret
+        # 直接失败拒绝出包——不带地址的包拦不住人，绝不能发出去；
+        # 手动触发允许不注入（授权层不启用），便于跑通流水线验证。
+        env:
+          ECH_UPDATE_REPO: ${{ github.repository }}
+          ECH_LICENSE_URL: ${{ secrets.ECH_LICENSE_URL }}
+        run: |
+          if [ -z "${ECH_LICENSE_URL}" ] && [ "${{ github.event_name }}" = "push" ]; then
+            echo "::error::ECH_LICENSE_URL secret 未配置：正式发版必须先在仓库 Secrets 里配置"
+            exit 1
+          fi
+          ./build.sh
+
+      - name: Package DMG
+        # CI 没有 GUI 会话，跳过 Finder 布局（make-dmg.sh 里 FINDER_LAYOUT=0 会跳过）
+        run: FINDER_LAYOUT=0 ./make-dmg.sh
+
+      - name: List artifacts
+        run: ls -la build/
+
+      # 发版正文取 docs/releases/<版本>.md（精简文案，按需手写）；没写就
+      # 退回 GitHub 自动生成。想润色也可以在 Release 发布后到网页上编辑。
+      - name: Generate release notes
+        run: |
+          TAG="${{ steps.ver.outputs.TAG }}"
+          NOTES=""
+          if [ -f "docs/releases/${TAG}.md" ]; then
+            NOTES=$(cat "docs/releases/${TAG}.md")
+          fi
+          if [ -z "$NOTES" ]; then
+            PREV=$(git tag --sort=-version:refname | sed -n '2p')
+            if [ -n "$PREV" ] && [ "$PREV" != "$TAG" ]; then
+              NOTES=$(gh api -X POST "repos/${{ github.repository }}/releases/generate-notes" \
+                -f tag_name="$TAG" \
+                -f target_commitish="$(git rev-parse HEAD)" \
+                -f previous_tag_name="$PREV" \
+                --jq '.body')
+            else
+              NOTES="首次发布，包含完整功能。"
+            fi
+          fi
+          {
+            echo "## EchOS $TAG"
+            echo ""
+            echo "macOS 13.0+，Intel 与 Apple Silicon 通用。"
+            echo ""
+            echo "- 下载 \`EchOS-mac-*-universal-x64.dmg\` 后拖入 Applications"
+            echo "- 无 Apple 开发者签名，首次打开需右键 → 打开（Gatekeeper）"
+            echo ""
+            echo "$NOTES"
+          } > RELEASE_BODY.md
+
+      - name: Create release & upload DMG
+        # 由标签触发；GitHub 会自动给每个 Release 附上
+        # "Source code (zip)" 和 "Source code (tar.gz)"
+        # 手动触发时 tag_name 用输入框版本号拼成的标签（不存在会自动创建）
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.ver.outputs.TAG }}
+          name: EchOS ${{ steps.ver.outputs.TAG }}
+          body_path: RELEASE_BODY.md
+          files: EchOS-mac-*.dmg

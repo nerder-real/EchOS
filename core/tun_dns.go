@@ -1,0 +1,997 @@
+//go:build darwin
+
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"crypto/tls"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"net/netip"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+const (
+	dnsTypeA    uint16 = 1
+	dnsTypeAAAA uint16 = 28
+)
+
+// DNSHandler manages TUN DNS processing
+type DNSHandler struct {
+	handler    *tunConnHandler
+	ipStrategy byte
+	pool       *ECHPool
+
+	dnsMu          sync.Mutex
+	dnsServers     []string
+	dnsServersTime time.Time
+	dnsIfaceIndex  int
+
+	// DoH 长连接（见 dohClient 注释）
+	dohMu           sync.Mutex
+	dohClientCache  *http.Client
+	dohDisableUntil time.Time    // 长连接确认异常后的冷静期截止时刻
+	dohEPIdx        atomic.Int32 // 当前生效的 dohEndpoints 下标（成功过就记住）
+}
+
+var dnsHandlerInstance *DNSHandler
+
+func newDNSHandler(handler *tunConnHandler) *DNSHandler {
+	dnsHandlerInstance = &DNSHandler{
+		handler:    handler,
+		ipStrategy: ipStrategy,
+		pool:       handler.pool,
+	}
+	return dnsHandlerInstance
+}
+
+func (d *DNSHandler) currentPhysIface() *net.Interface {
+	if d == nil || d.handler == nil {
+		return nil
+	}
+	return d.handler.getPhysicalInterface()
+}
+
+// ProcessDNSQuery processes a DNS query packet and returns the response.
+func ProcessDNSQuery(q []byte) []byte {
+	if dnsHandlerInstance == nil {
+		return nil
+	}
+	t0 := time.Now()
+	domain := extractDNSName(q)
+	if domain == "?" || domain == "." {
+		return nil
+	}
+
+	var reply []byte
+
+	decision, matchedRule := dnsRouteForDomain(domain)
+	route := dnsRouteLabel(decision, matchedRule)
+	if decision == DecisionBlock {
+		log.Printf("[DNS][block] %s %s -> BLOCKED (%s)", domain, dnsQuestionTypeName(q), matchedRule)
+		return servfailReply(q)
+	}
+
+	// Fast path: check DNS cache first
+	if cached := lookupDNSCache(domain, q); cached != nil {
+		cached[0], cached[1] = q[0], q[1] // match query ID
+		cached = dnsHandlerInstance.applyIPStrategyToDNS(domain, q, cached, decision)
+		cached[0], cached[1] = q[0], q[1]
+		logDNSResult(domain, q, cached, "cache", time.Since(t0))
+		return cached
+	}
+
+	if decision == DecisionDirect {
+		reply = dnsHandlerInstance.resolveLocal(q)
+	} else {
+		reply = dnsHandlerInstance.resolveRemote(q)
+	}
+	if reply == nil {
+		reply = servfailReply(q)
+		logDNSServFail(domain, q, route, time.Since(t0))
+	} else {
+		reply = dnsHandlerInstance.applyIPStrategyToDNS(domain, q, reply, decision)
+		reply[0], reply[1] = q[0], q[1]
+		cacheDNSReply(domain, reply)
+		logDNSResult(domain, q, reply, route, time.Since(t0))
+	}
+	return reply
+}
+
+func findQuestionEnd(q []byte) int {
+	qEnd := 12
+	for qEnd < len(q) {
+		if q[qEnd] == 0 {
+			qEnd += 5
+			break
+		}
+		if q[qEnd]&0xC0 == 0xC0 {
+			qEnd += 6
+			break
+		}
+		qEnd += int(q[qEnd]) + 1
+	}
+	return qEnd
+}
+
+// runDNSListener starts DNS listeners on TUN gateway addresses
+func runDNSListener(cfg *TunConfig, handler *tunConnHandler) {
+	dnsH := newDNSHandler(handler)
+	// 预热 DoH 长连接，避免用户打开的第一个网页为首个域名付一次完整握手
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		dnsH.warmupDoH()
+	}()
+	seen := make(map[string]bool)
+	for _, gw := range cfg.Gateway {
+		host := strings.TrimSpace(gw)
+		if host == "" {
+			continue
+		}
+		if p, err := netip.ParsePrefix(host); err == nil {
+			host = p.Addr().String()
+		} else if strings.Contains(host, "/") {
+			host = strings.Split(host, "/")[0]
+		}
+		addr := net.JoinHostPort(host, "53")
+		if seen[addr] {
+			continue
+		}
+		seen[addr] = true
+		go dnsH.start(addr)
+	}
+}
+
+func (d *DNSHandler) start(addr string) {
+	ua, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		log.Printf("[DNS] resolve %s failed: %v", addr, err)
+		return
+	}
+	c, err := net.ListenUDP("udp", ua)
+	if err != nil {
+		log.Printf("[DNS] listen %s failed: %v", addr, err)
+		return
+	}
+	defer c.Close()
+	log.Printf("[DNS] listener started %s", addr)
+
+	b := make([]byte, 1500)
+	for {
+		n, ca, err := c.ReadFromUDP(b)
+		if err != nil || n < 12 {
+			continue
+		}
+		q := make([]byte, n)
+		copy(q, b[:n])
+		go d.handle(c, q, ca)
+	}
+}
+
+func (d *DNSHandler) handle(c *net.UDPConn, q []byte, ca *net.UDPAddr) {
+	t0 := time.Now()
+	domain := extractDNSName(q)
+	if domain == "?" || domain == "." {
+		return
+	}
+
+	var reply []byte
+
+	decision, matchedRule := dnsRouteForDomain(domain)
+	route := dnsRouteLabel(decision, matchedRule)
+	if decision == DecisionBlock {
+		log.Printf("[DNS][block] %s %s -> BLOCKED (%s)", domain, dnsQuestionTypeName(q), matchedRule)
+		c.WriteToUDP(servfailReply(q), ca)
+		return
+	}
+
+	// Fast path: check DNS cache first
+	if cached := lookupDNSCache(domain, q); cached != nil {
+		cached[0], cached[1] = q[0], q[1]
+		cached = d.applyIPStrategyToDNS(domain, q, cached, decision)
+		cached[0], cached[1] = q[0], q[1]
+		c.WriteToUDP(cached, ca)
+		logDNSResult(domain, q, cached, "cache", time.Since(t0))
+		return
+	}
+
+	if decision == DecisionDirect {
+		reply = d.resolveLocal(q)
+	} else {
+		reply = d.resolveRemote(q)
+	}
+	if reply == nil {
+		c.WriteToUDP(servfailReply(q), ca)
+		logDNSServFail(domain, q, route, time.Since(t0))
+		return
+	}
+
+	reply = d.applyIPStrategyToDNS(domain, q, reply, decision)
+	reply[0], reply[1] = q[0], q[1]
+	cacheDNSReply(domain, reply)
+	c.WriteToUDP(reply, ca)
+	logDNSResult(domain, q, reply, route, time.Since(t0))
+}
+
+func (d *DNSHandler) applyIPStrategyToDNS(domain string, q, reply []byte, decision RouteDecision) []byte {
+	// 严格单栈模式全局生效。
+	switch d.ipStrategy {
+	case IPStrategyIPv4Only:
+		return filterDNSReply(reply, IPStrategyIPv4Only)
+	case IPStrategyIPv6Only:
+		return filterDNSReply(reply, IPStrategyIPv6Only)
+	}
+
+	// 非严格模式下只对 direct 域名按本地物理网卡能力过滤。
+	// proxy 域名不能按本地能力过滤，否则会破坏 VPS 侧 IPv4/IPv6 访问能力。
+	if decision == DecisionDirect {
+		if iface := d.currentPhysIface(); iface != nil {
+			keepIPv4 := hasIPv4(iface)
+			keepIPv6 := hasGlobal6(iface)
+			if !keepIPv4 || !keepIPv6 {
+				return filterDNSReplyFamilies(reply, keepIPv4, keepIPv6)
+			}
+		}
+	}
+	return reply
+}
+
+// resolveLocal sends DNS query through physical NIC to system DNS servers.
+// Queries all servers concurrently and returns the first valid response.
+func (d *DNSHandler) resolveLocal(q []byte) []byte {
+	iface := d.currentPhysIface()
+	if iface == nil {
+		return nil
+	}
+	dnsServers := d.getSystemDNSServersCached()
+	if len(dnsServers) == 0 {
+		return nil
+	}
+	type result struct {
+		data []byte
+	}
+	ch := make(chan result, len(dnsServers))
+	for _, srv := range dnsServers {
+		go func(srv string) {
+			// 快照存的是裸 IP（含 IPv6，无端口）——SplitHostPort 对裸 IP 直接
+			// 报错，2026-11-13 实录：国内域名全部秒级 SERVFAIL 就是栽在这里。
+			// 统一补 53 端口；JoinHostPort 会给 IPv6 自动套方括号。
+			host, portStr, err := net.SplitHostPort(net.JoinHostPort(srv, "53"))
+			if err != nil {
+				ch <- result{}
+				return
+			}
+			port := 53
+			if portStr != "" {
+				fmt.Sscanf(portStr, "%d", &port)
+			}
+			conn, err := directDialUDP(host, port, iface)
+			if err != nil {
+				ch <- result{}
+				return
+			}
+			defer conn.Close()
+			conn.SetDeadline(time.Now().Add(3 * time.Second))
+			if _, err := conn.Write(q); err != nil {
+				ch <- result{}
+				return
+			}
+			resp := make([]byte, 1500)
+			n, err := conn.Read(resp)
+			if err == nil && n > 12 {
+				ch <- result{resp[:n]}
+				return
+			}
+			ch <- result{}
+		}(srv)
+	}
+	// Wait for first valid response or all to fail
+	for range dnsServers {
+		r := <-ch
+		if r.data != nil {
+			return r.data
+		}
+	}
+	return nil
+}
+
+func (d *DNSHandler) getSystemDNSServersCached() []string {
+	iface := d.currentPhysIface()
+	if iface == nil {
+		return nil
+	}
+	d.dnsMu.Lock()
+	defer d.dnsMu.Unlock()
+	if d.dnsIfaceIndex == iface.Index && !d.dnsServersTime.IsZero() && time.Since(d.dnsServersTime) < 30*time.Second {
+		return append([]string(nil), d.dnsServers...)
+	}
+	servers := getSystemDNSServers(iface)
+	d.dnsServers = append([]string(nil), servers...)
+	d.dnsServersTime = time.Now()
+	d.dnsIfaceIndex = iface.Index
+	return servers
+}
+
+// getSystemDNSServers 读取物理网卡上配置的 DNS。
+// darwin 没有 Windows GetAdaptersAddresses 的等价 API：改用劫持前的运营商
+// DNS 快照（tun_device_darwin.go 的 snapshotCarrierDNS，resolv.conf +
+// 各网络服务原值合并）。空快照返回 nil，上层 dialPhysDNS 退回 Go 默认。
+// 分流域名的 DNS 劫持由 TUN 网关监听（runDNSListener）负责，不依赖这里。
+func getSystemDNSServers(iface *net.Interface) []string {
+	return getCarrierDNSServers()
+}
+
+// DoH 端点候选，按顺序尝试，成功过的那个会被记住（sticky）。
+//
+// ★ dns.google 必须排在第一位，原因是 Cloudflare 官方文档明确写了
+// 「Outbound TCP sockets to Cloudflare IP ranges are blocked.」
+// （developers.cloudflare.com/workers/runtime-apis/tcp-sockets 的
+// Considerations / Troubleshooting：不允许的地址包括 Cloudflare IPs、
+// localhost、内网 IP，报错 `cannot connect to the specified address`）。
+//
+// 而本项目实际部署的服务端就是 Cloudflare Worker（worker/Worker-ECH.js，
+// 用的是 `connect()` 而不是 `fetch()`，所以这条封锁确实生效），
+// `cloudflare-dns.com` 恰好解析到 CF 自家网段（104.16.248.249 等）。
+//
+// Worker 侧虽然有兜底：`CF_FALLBACK_IPS = ['ProxyIP.CMLiussss.net']`，
+// connect 撞到 CF 错误时会改用这个社区维护的反代 IP，靠客户端 TLS SNI
+// 转发到真实目标 —— 也就是说 cloudflare-dns.com 最终**能通**，但代价是：
+//  1. 每次建连都要先失败一次（Worker 的 connect 超时给到 6 秒）；
+//  2. 还要再绕一层社区维护的中转，那个域名失效是常态；
+//  3. 客户端侧 dialViaTunnel 的快速失败阈值只有 700ms，
+//     这一来一回很容易超阈值 → 白跑 3 次 WS 握手才成功。
+//
+// dns.google 是非 CF 网段，Worker 可以直连，无需中转、一次握手即成。
+// 把它放在后面只作为兜底：万一某个服务端的出口访问不了 Google，
+// 还能落回 Cloudflare（自建 x-tunnel/smux 服务端就是自己的 Go 进程，
+// 连 CF 毫无限制，直接可用）。
+var dohEndpoints = []dohEndpoint{
+	{name: "dns.google", host: "dns.google:443", sni: "dns.google", url: "https://dns.google/dns-query"},
+	{name: "cloudflare-dns.com", host: "cloudflare-dns.com:443", sni: "cloudflare-dns.com", url: "https://cloudflare-dns.com/dns-query"},
+}
+
+type dohEndpoint struct {
+	name string // 预热用的查询域名
+	host string // 隧道 CONNECT 的目标
+	sni  string // TLS SNI / Host
+	url  string // DoH POST 地址
+}
+
+const (
+	// 单次解析的总预算。改造前每条查询是 SetDeadline(5s) 的硬上限，这里必须
+	// 保持同量级：长连接一旦半开（对端单方面断开、WebSocket 重连后 smux 会话
+	// 失效等），请求会一直挂到超时，预算过大就会把所有域名解析拖成十几秒，
+	// 浏览器侧直接表现为「网页打不开」。
+	dohQueryTimeout = 6 * time.Second
+	// 长连接分到的预算，剩余时间留给一次性连接兜底
+	dohPersistentTimeout = 3 * time.Second
+	// 长连接确认异常后的冷静期，期间直接走一次性连接
+	dohCoolDown = 30 * time.Second
+)
+
+// dohClient 返回（必要时新建）DoH 长连接客户端。
+//
+// 改造前每个未命中缓存的域名都要：新建一条 smux 流 → 完整 TLS 握手 → 发一个
+// DoH 请求 → 立刻关闭（req.Close = true）。打开 Google / YouTube 这类要解析
+// 十几个域名的页面时，握手是串行叠加的，这是「首次打开慢」的主因。
+//
+// 现在改为维护一个长连接客户端：优先 HTTP/2 多路复用，并发的 A / AAAA 以及
+// 不同域名的查询共享同一条连接；即使对端不协商 h2，也会退化成 HTTP/1.1
+// keep-alive 复用。注意调用方必须给每次请求单独设超时，这里不设 client.Timeout。
+func (d *DNSHandler) dohClient() *http.Client {
+	d.dohMu.Lock()
+	defer d.dohMu.Unlock()
+	if d.dohClientCache != nil {
+		return d.dohClientCache
+	}
+	if d.pool == nil {
+		return nil
+	}
+	d.dohClientCache = &http.Client{
+		Transport: &http.Transport{
+			Proxy: nil,
+			// 自定义拨号：在隧道流上完成 TLS，连接交由上层复用。
+			// 必须用 dialViaTunnel 而不是 pool.openTCPStream —— 后者是 smux 专用，
+			// simple 协议（Worker-ECH.js）下必然失败，表现是 DNS 全部 SERVFAIL，
+			// TUN 模式下等于断网。
+			//
+			// ★ 拨号目标用传进来的 addr（来自请求 URL 的 host:port），
+			// 不再写死某一个 DoH 主机 —— 这样同一个 client 就能服务
+			// dohEndpoints 里的任意端点（Transport 按 host 分别维护连接池），
+			// 端点切换时也不需要重建 client。
+			DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				sni, _, err := net.SplitHostPort(addr)
+				if err != nil || sni == "" {
+					sni = addr
+				}
+				ob, err := dialViaTunnel(addr)
+				if err != nil {
+					return nil, err
+				}
+				tc := tls.Client(asNetConn(ob.rw), &tls.Config{
+					ServerName: sni,
+					MinVersion: tls.VersionTLS12,
+					// 使用自定义 DialTLSContext 时 transport 不会代劳，
+					// 必须自己声明 h2，否则永远协商不到 HTTP/2。
+					NextProtos: []string{"h2", "http/1.1"},
+				})
+				if err := tc.HandshakeContext(ctx); err != nil {
+					ob.rw.Close()
+					return nil, err
+				}
+				return tc, nil
+			},
+			ForceAttemptHTTP2:     true,
+			TLSHandshakeTimeout:   5 * time.Second,
+			MaxIdleConns:          8,
+			MaxConnsPerHost:       4,
+			MaxIdleConnsPerHost:   2,
+			IdleConnTimeout:       60 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		},
+	}
+	return d.dohClientCache
+}
+
+// resetDohClient 丢弃当前长连接，下一次查询会重新建连。
+func (d *DNSHandler) resetDohClient() {
+	d.dohMu.Lock()
+	c := d.dohClientCache
+	d.dohClientCache = nil
+	d.dohMu.Unlock()
+	if c != nil {
+		c.CloseIdleConnections()
+	}
+}
+
+// dohPersistentAllowed 报告长连接是否处于可用期（不在冷静期内）。
+func (d *DNSHandler) dohPersistentAllowed() bool {
+	d.dohMu.Lock()
+	defer d.dohMu.Unlock()
+	return time.Now().After(d.dohDisableUntil)
+}
+
+// markDohBroken 让长连接在冷静期内停用，改用一次性连接。
+func (d *DNSHandler) markDohBroken() {
+	d.dohMu.Lock()
+	d.dohDisableUntil = time.Now().Add(dohCoolDown)
+	d.dohMu.Unlock()
+}
+
+// currentDoH 返回当前生效的 DoH 端点。
+func (d *DNSHandler) currentDoH() dohEndpoint {
+	idx := int(d.dohEPIdx.Load())
+	if idx < 0 || idx >= len(dohEndpoints) {
+		idx = 0
+	}
+	return dohEndpoints[idx]
+}
+
+// warmupDoH 在 TUN 启动后提前把 DoH 连接建好，避免首个域名解析付一次冷启动。
+// 预热失败不进冷静期（此时隧道可能还没就绪，属正常现象）。
+func (d *DNSHandler) warmupDoH() {
+	ep := d.currentDoH()
+	q := buildDNSQuery(ep.name, dnsTypeA)
+	if len(q) == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), dohQueryTimeout)
+	defer cancel()
+	if _, err := d.dohViaPersistent(ctx, q, ep); err == nil {
+		log.Printf("[DNS] DoH 长连接预热完成（%s）", ep.name)
+	} else {
+		d.resetDohClient()
+	}
+}
+
+// resolveRemote resolves DNS via tunnel DoH.
+//
+// 依次尝试 dohEndpoints 里的端点，任一成功即返回，并把它记为当前端点
+// （下次直接用，不再逐个试）。之所以要逐个试：本项目实际部署的服务端是
+// Cloudflare Worker，而 Workers 的 connect() 禁止连 CF 自家网段，
+// `cloudflare-dns.com` 必然失败（见 dohEndpoints 上方注释）。
+func (d *DNSHandler) resolveRemote(q []byte) []byte {
+	if d.pool == nil {
+		return nil
+	}
+	start := int(d.dohEPIdx.Load())
+	if start < 0 || start >= len(dohEndpoints) {
+		start = 0
+	}
+	for i := 0; i < len(dohEndpoints); i++ {
+		idx := (start + i) % len(dohEndpoints)
+		ep := dohEndpoints[idx]
+		if body := d.resolveRemoteVia(q, ep); body != nil {
+			if idx != start {
+				d.dohEPIdx.Store(int32(idx))
+				log.Printf("[DNS] DoH 端点切换到 %s", ep.name)
+			}
+			return body
+		}
+	}
+	return nil
+}
+
+// resolveRemoteVia 用指定端点完成一次解析：先长连接，超时/失败再一次性连接。
+func (d *DNSHandler) resolveRemoteVia(q []byte, ep dohEndpoint) []byte {
+	ctx, cancel := context.WithTimeout(context.Background(), dohQueryTimeout)
+	defer cancel()
+
+	// 优先走长连接，但它只拿到总预算的一部分，超时立刻放弃换兜底路径
+	if d.dohPersistentAllowed() {
+		pctx, pcancel := context.WithTimeout(ctx, dohPersistentTimeout)
+		body, err := d.dohViaPersistent(pctx, q, ep)
+		pcancel()
+		if err == nil {
+			return body
+		}
+		if pctx.Err() != nil {
+			// 超时：可能只是这一次慢，丢弃连接让下次重建即可
+			d.resetDohClient()
+		} else {
+			// 连接级错误：长连接确实坏了，进冷静期避免每条查询都空等一遍
+			log.Printf("[DNS] DoH 长连接异常（%v），%.0fs 内改用一次性连接", err, dohCoolDown.Seconds())
+			d.resetDohClient()
+			d.markDohBroken()
+		}
+	}
+	if ctx.Err() != nil {
+		return nil
+	}
+	return d.dohSingleShot(ctx, q, ep)
+}
+
+// dohViaPersistent 复用长连接完成一次 DoH 查询。ctx 由调用方限定。
+func (d *DNSHandler) dohViaPersistent(ctx context.Context, q []byte, ep dohEndpoint) ([]byte, error) {
+	client := d.dohClient()
+	if client == nil {
+		return nil, errors.New("隧道未就绪")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, ep.url, bytes.NewReader(q))
+	if err != nil {
+		return nil, err
+	}
+	req.ContentLength = int64(len(q))
+	req.Header.Set("Content-Type", "application/dns-message")
+	req.Header.Set("Accept", "application/dns-message")
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if body, ok := readDoHResponse(resp); ok {
+		return body, nil
+	}
+	return nil, fmt.Errorf("响应异常 status=%d", resp.StatusCode)
+}
+
+// dohSingleShot 兜底路径，行为与改造前一致：新建一条流完成一次查询后立即关闭。
+// 同样走 dialViaTunnel —— simple 协议下没有 smux 池，直连 openTCPStream 必然失败。
+func (d *DNSHandler) dohSingleShot(ctx context.Context, q []byte, ep dohEndpoint) []byte {
+	ob, err := dialViaTunnel(ep.host)
+	if err != nil {
+		return nil
+	}
+	defer ob.rw.Close()
+	tc := tls.Client(asNetConn(ob.rw), &tls.Config{ServerName: ep.sni, MinVersion: tls.VersionTLS12})
+	if dl, ok := ctx.Deadline(); ok {
+		tc.SetDeadline(dl)
+	} else {
+		tc.SetDeadline(time.Now().Add(dohQueryTimeout))
+	}
+	if err := tc.Handshake(); err != nil {
+		return nil
+	}
+	defer tc.Close()
+	req, err := http.NewRequest(http.MethodPost, ep.url, bytes.NewReader(q))
+	if err != nil {
+		return nil
+	}
+	req.ContentLength = int64(len(q))
+	req.Header.Set("Content-Type", "application/dns-message")
+	req.Header.Set("Accept", "application/dns-message")
+	req.Host = ep.sni
+	req.Close = true
+	if err := req.Write(tc); err != nil {
+		return nil
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(tc), req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	body, _ := readDoHResponse(resp)
+	return body
+}
+
+// readDoHResponse 读取并校验一次 DoH 响应，返回报文体。
+func readDoHResponse(resp *http.Response) ([]byte, bool) {
+	if resp.StatusCode != http.StatusOK {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return nil, false
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	if err != nil || len(body) < 12 {
+		return nil, false
+	}
+	return body, true
+}
+
+// ====== DNS protocol utility functions ======
+
+func extractDNSName(q []byte) string {
+	if len(q) < 12 {
+		return "?"
+	}
+	var p []byte
+	pos := 12
+	for pos < len(q) {
+		b := q[pos]
+		if b == 0 {
+			break
+		}
+		if b&0xC0 == 0xC0 {
+			break
+		}
+		l := int(b)
+		pos++
+		if pos+l > len(q) {
+			return string(p)
+		}
+		if len(p) > 0 {
+			p = append(p, '.')
+		}
+		p = append(p, q[pos:pos+l]...)
+		pos += l
+	}
+	if len(p) == 0 {
+		return "."
+	}
+	return string(p)
+}
+
+func unpackDNSHeader(q []byte) (id uint16, flags uint16, qdcount uint16) {
+	if len(q) < 12 {
+		return
+	}
+	id = binary.BigEndian.Uint16(q[0:2])
+	flags = binary.BigEndian.Uint16(q[2:4])
+	qdcount = binary.BigEndian.Uint16(q[4:6])
+	return
+}
+
+func dnsQuestionType(q []byte) uint16 {
+	if len(q) < 12 {
+		return 0
+	}
+	pos := 12
+	for pos < len(q) {
+		if q[pos] == 0 {
+			pos++
+			break
+		}
+		if q[pos]&0xC0 == 0xC0 {
+			pos += 2
+			break
+		}
+		l := int(q[pos])
+		pos++
+		if pos+l > len(q) {
+			return 0
+		}
+		pos += l
+	}
+	if pos+4 > len(q) {
+		return 0
+	}
+	return binary.BigEndian.Uint16(q[pos : pos+2])
+}
+
+func dnsQuestionTypeName(q []byte) string {
+	switch dnsQuestionType(q) {
+	case dnsTypeA:
+		return "A"
+	case dnsTypeAAAA:
+		return "AAAA"
+	default:
+		return fmt.Sprintf("TYPE%d", dnsQuestionType(q))
+	}
+}
+
+func servfailReply(q []byte) []byte {
+	qEnd := findQuestionEnd(q)
+	sf := make([]byte, qEnd)
+	copy(sf, q[:qEnd])
+	sf[2] = 0x81
+	sf[3] = 0x82
+	for i := 6; i < 12; i += 2 {
+		sf[i] = 0
+		sf[i+1] = 0
+	}
+	return sf
+}
+
+func dnsTypeName(rrType uint16) string {
+	switch rrType {
+	case dnsTypeA:
+		return "A"
+	case dnsTypeAAAA:
+		return "AAAA"
+	default:
+		return fmt.Sprintf("TYPE%d", rrType)
+	}
+}
+
+func logDNSResult(domain string, q, reply []byte, route string, elapsed time.Duration) {
+	answers := extractDNSAnswerIPs(reply)
+	action, reason := dnsLogParts(route)
+	log.Printf("[DNS][%s] %s %s -> %s (%s, %v)", action, domain, dnsQuestionTypeName(q), answers, reason, elapsed)
+}
+
+func logDNSServFail(domain string, q []byte, route string, elapsed time.Duration) {
+	action, reason := dnsLogParts(route)
+	log.Printf("[DNS][%s] %s %s -> SERVFAIL (%s, %v)", action, domain, dnsQuestionTypeName(q), reason, elapsed)
+}
+
+func dnsRouteLabel(decision RouteDecision, matchedRule string) string {
+	if matchedRule == "" {
+		matchedRule = "default"
+	}
+	if decision == DecisionDirect {
+		return "direct:" + matchedRule
+	}
+	return "proxy:" + matchedRule
+}
+
+func dnsLogParts(route string) (action string, reason string) {
+	switch {
+	case route == "cache":
+		return "cache", "hit"
+	case strings.HasPrefix(route, "direct:"):
+		return "direct", strings.TrimPrefix(route, "direct:")
+	case strings.HasPrefix(route, "proxy:"):
+		return "proxy", strings.TrimPrefix(route, "proxy:")
+	case route == "remote":
+		return "proxy", "remote"
+	case route != "":
+		return "proxy", route
+	default:
+		return "proxy", "default"
+	}
+}
+
+func refreshDirectDomainFamily(domain string, rrType uint16) []string {
+	if dnsHandlerInstance == nil || domain == "" {
+		return nil
+	}
+	q := buildDNSQuery(domain, rrType)
+	if len(q) == 0 {
+		return nil
+	}
+	reply := dnsHandlerInstance.resolveLocal(q)
+	if len(reply) < 12 {
+		return nil
+	}
+	cacheDNSReply(domain, reply)
+	return lookupIPsByDomainFamily(domain, rrType == dnsTypeAAAA)
+}
+
+func skipDNSName(msg []byte, pos int) (int, bool) {
+	for pos < len(msg) {
+		b := msg[pos]
+		if b == 0 {
+			return pos + 1, true
+		}
+		if b&0xC0 == 0xC0 {
+			if pos+2 > len(msg) {
+				return 0, false
+			}
+			return pos + 2, true
+		}
+		pos++
+		if pos+int(b) > len(msg) {
+			return 0, false
+		}
+		pos += int(b)
+	}
+	return 0, false
+}
+
+func skipDNSQuestions(msg []byte, pos int, qdcount int) (int, bool) {
+	for i := 0; i < qdcount; i++ {
+		var ok bool
+		pos, ok = skipDNSName(msg, pos)
+		if !ok || pos+4 > len(msg) {
+			return 0, false
+		}
+		pos += 4
+	}
+	return pos, true
+}
+
+func extractDNSAnswerIPs(reply []byte) string {
+	if len(reply) < 12 {
+		return "?"
+	}
+	qdcount := int(binary.BigEndian.Uint16(reply[4:6]))
+	pos, ok := skipDNSQuestions(reply, 12, qdcount)
+	if !ok {
+		return "?"
+	}
+	var ips []string
+	totalRR := int(binary.BigEndian.Uint16(reply[6:8])) +
+		int(binary.BigEndian.Uint16(reply[8:10])) +
+		int(binary.BigEndian.Uint16(reply[10:12]))
+	rrCount := 0
+	for i := 0; i < totalRR; i++ {
+		if pos+12 > len(reply) {
+			break
+		}
+		if reply[pos]&0xC0 == 0xC0 {
+			pos += 2
+		} else {
+			for pos < len(reply) && reply[pos] != 0 {
+				l := int(reply[pos])
+				pos++
+				if pos+l > len(reply) {
+					return "?"
+				}
+				pos += l
+			}
+			pos++
+		}
+		if pos+10 > len(reply) {
+			break
+		}
+		atype := binary.BigEndian.Uint16(reply[pos:])
+		dlen := int(binary.BigEndian.Uint16(reply[pos+8:]))
+		pos += 10
+		if pos+dlen > len(reply) {
+			break
+		}
+		rrCount++
+		if atype == 1 && dlen == 4 {
+			ips = append(ips, net.IP(reply[pos:pos+4]).String())
+		} else if atype == 28 && dlen == 16 {
+			ips = append(ips, net.IP(reply[pos:pos+16]).String())
+		}
+		pos += dlen
+	}
+	if len(ips) > 0 {
+		return strings.Join(ips, ",")
+	}
+	if rrCount > 0 {
+		return fmt.Sprintf("rr=%d", rrCount)
+	}
+	return "no-answer"
+}
+
+func filterDNSReply(reply []byte, strategy byte) []byte {
+	switch strategy {
+	case IPStrategyIPv4Only:
+		return filterDNSReplyFamilies(reply, true, false)
+	case IPStrategyIPv6Only:
+		return filterDNSReplyFamilies(reply, false, true)
+	default:
+		return reply
+	}
+}
+
+func filterDNSReplyFamilies(reply []byte, hasIPv4, hasIPv6 bool) []byte {
+	if len(reply) < 12 {
+		return reply
+	}
+
+	out := make([]byte, len(reply))
+	copy(out, reply)
+
+	pos := 12
+	for pos < len(out) {
+		if out[pos] == 0 {
+			pos++
+			break
+		}
+		if out[pos]&0xC0 == 0xC0 {
+			pos += 2
+			break
+		}
+		l := int(out[pos])
+		pos++
+		if pos+l > len(out) {
+			return reply
+		}
+		pos += l
+	}
+	if pos+4 > len(out) {
+		return reply
+	}
+	pos += 4
+
+	origAncount := int(binary.BigEndian.Uint16(out[6:8]))
+	if origAncount == 0 {
+		return reply
+	}
+
+	var newAnswers []byte
+	newAncount := uint16(0)
+	for i := 0; i < origAncount; i++ {
+		if pos+12 > len(out) {
+			break
+		}
+		answerStart := pos
+		if out[pos]&0xC0 == 0xC0 {
+			pos += 2
+		} else {
+			for pos < len(out) && out[pos] != 0 {
+				l := int(out[pos])
+				pos++
+				if pos+l > len(out) {
+					return reply
+				}
+				pos += l
+			}
+			pos++
+		}
+		if pos+10 > len(out) {
+			break
+		}
+		atype := binary.BigEndian.Uint16(out[pos:])
+		dlen := int(binary.BigEndian.Uint16(out[pos+8:]))
+		pos += 10
+		if pos+dlen > len(out) {
+			break
+		}
+		keep := false
+		if atype == 1 {
+			keep = hasIPv4
+		} else if atype == 28 {
+			keep = hasIPv6
+		} else {
+			keep = true
+		}
+		if keep {
+			seg := make([]byte, pos+dlen-answerStart)
+			copy(seg, out[answerStart:pos+dlen])
+			newAnswers = append(newAnswers, seg...)
+			newAncount++
+		}
+		pos += dlen
+	}
+
+	hdr := make([]byte, 12)
+	copy(hdr, out[:12])
+	binary.BigEndian.PutUint16(hdr[6:8], newAncount)
+	binary.BigEndian.PutUint16(hdr[8:10], 0)
+	binary.BigEndian.PutUint16(hdr[10:12], 0)
+
+	qpos := 12
+	for qpos < len(out) {
+		if out[qpos] == 0 {
+			qpos += 5
+			break
+		}
+		if out[qpos]&0xC0 == 0xC0 {
+			qpos += 6
+			break
+		}
+		l := int(out[qpos])
+		qpos++
+		qpos += l
+	}
+
+	var result []byte
+	result = append(result, hdr...)
+	result = append(result, out[12:qpos]...)
+	result = append(result, newAnswers...)
+	return result
+}
