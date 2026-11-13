@@ -26,6 +26,12 @@ final class AppState: NSObject, ObservableObject {
     /// 启动/停止两个按钮都必须禁用——防重复 stop（重复还原系统代理、
     /// 撞尚未释放的端口），也防用户在旧内核还占着端口时点启动。
     @Published var isStopping = false
+
+    /// 运行 / 启动 / 停止中任一状态。对齐 Win 端 isBusy（home_page.dart
+    /// `locked = app.isBusy`）：此时锁定配置文本框——修改需要「保存 → 重启」
+    /// 才生效，而运行中「保存」是禁用的，从源头避免「改了存不了」的无效修改。
+    /// 分流模式与规则区不在此列（切换 / 修改走各自的即时生效提示路径）。
+    var isBusy: Bool { isRunning || isStarting || isStopping }
     /// 本会话确实启动过 root 内核（TUN）且尚未停止。stop()/shutdown()
     /// 据此选择停止路径——config.tunMode 会先于停止动作被改写，不可信。
     var rootKernelActive = false

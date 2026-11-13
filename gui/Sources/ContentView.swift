@@ -493,20 +493,20 @@ struct ContentView: View {
                         addNewBlocked = true
                     }
                 }
-                .disabled(app.isRunning)
+                .disabled(app.isBusy)
                 Button("重命名") {
                     renameText = app.selected?.name ?? ""
                     nameErrorText = ""
                     renaming = true
                 }
-                .disabled(app.isRunning)
+                .disabled(app.isBusy)
                 persistentTint(app.isServerDirty ? .orange : .green,
-                               isActive: !app.isRunning) {
+                               isActive: !app.isBusy) {
                     saveSelected()
                 } label: {
                     Text("保存")
                 }
-                persistentTint(.red, isActive: !app.isRunning) {
+                persistentTint(.red, isActive: !app.isBusy) {
                     confirmDelete = true
                 } label: {
                     Text("删除")
@@ -607,6 +607,9 @@ struct ContentView: View {
                             hostPlaceholder: "127.0.0.1")
                 row("优选域名(IP):", binding(\.ip), placeholder: "104.18.xx.xx")
             }
+            // 对齐 Win 约定（home_page.dart `locked = app.isBusy`）：运行/启动/
+            // 停止中锁定配置文本框——运行中「保存」禁用，改了存不了，从源头锁掉。
+            .disabled(app.isBusy)
         }
     }
 
@@ -617,8 +620,10 @@ struct ContentView: View {
             VStack(spacing: 8) {
                 presetRow("ECH域名:", binding(\.ech), options: EchPresets.echDomains,
                           placeholder: "cloudflare-ech.com")
+                    .disabled(app.isBusy)
                 presetRow("DOH服务器:", binding(\.dns), options: EchPresets.dnsServers,
                           placeholder: "dns.alidns.com/dns-query")
+                    .disabled(app.isBusy)
 
                 HStack(spacing: 8) {
                     Text("分流模式:")
@@ -854,7 +859,7 @@ struct ContentView: View {
                 // 按钮语义对齐 Win（2026-09-23 拍板）：启动中两个按钮都灰着，
                 // 状态交给状态灯（黄）+「启动中…」文案；停止收尾期间同样两按钮
                 // 都灰（isStopping），防重复 stop 撞未释放的端口。
-                persistentTint(.blue, isActive: !app.isRunning && !app.isStarting && !app.isStopping) {
+                persistentTint(.blue, isActive: !app.isBusy) {
                     Task { await app.startViaLicense() }
                 } label: {
                     Label("启动代理", systemImage: "play.fill")
