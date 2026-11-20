@@ -657,6 +657,12 @@ struct AppConfig: Codable {
         enc.outputFormatting = [.prettyPrinted, .sortedKeys]
         if let data = try? enc.encode(self) {
             try? data.write(to: Self.fileURL, options: .atomic)
+            // .atomic 是「写临时文件再 rename」：新文件权限每次都重置回 umask
+            // 默认（644），光 chmod 一次会被下一次 persist 打回原形。config.json
+            // 含服务器 TOKEN 明文，必须每次写入后补收紧到 0600——与 license.json
+            // （LicenseService.saveLocal）同一口径。
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600],
+                                                   ofItemAtPath: Self.fileURL.path)
         }
     }
 }

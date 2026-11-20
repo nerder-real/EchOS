@@ -233,7 +233,7 @@ enum SystemProxy {
             warnings.append("清空后读回仍有残留：\(residue)，重试一次…")
             for cmd in ["-setwebproxystate", "-setsecurewebproxystate",
                         "-setsocksfirewallproxystate", "-setautoproxystate"] {
-                try? run([cmd, svc, "off"])
+                _ = try? run([cmd, svc, "off"])
             }
             if let residue2 = proxyResidue(svc) {
                 warnings.append("重试后仍有残留：\(residue2)——浏览器可能仍绕开 TUN，请到「系统设置 → 网络 → 详细信息 → 代理」手动关闭")

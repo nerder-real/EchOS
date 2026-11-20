@@ -117,6 +117,12 @@ func dialTargetWithRoute(target string) (*outbound, error) {
 }
 
 // 服务端协议：0=未探测 1=x-tunnel(smux) 2=简易 WebSocket 代理
+//
+// 注意：protoSmux 目前没有任何赋值点——detectServerProtocol 的两条路径
+// （探测成功/失败）都 Store(protoSimple)。因此客户端侧的 smux 通道池
+// （ECHPool.Start / dialAndServe / openTCPStream / WaitForChannelReady）
+// 整体不可达，代码保留只为 x-tunnel 独立服务端模式（-l wss://...）的
+// 自洽；若确认永不需要 smux 服务端，可连同 ECHPool 的 smux 字段一起删。
 var serverProtocol atomic.Int32
 
 const (

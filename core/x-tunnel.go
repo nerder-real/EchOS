@@ -651,13 +651,17 @@ func main() {
 		}
 
 		// Build TUN config
-		routes := []string{"0.0.0.0/0"}
+		// hijackTargets 只作日志展示，与 tun.Start() 里实际劫持的路由保持
+		// 同一口径（0.0.0.0/1 + 128.0.0.0/1，IPv6 为 2000::/3）。此前的
+		// TunConfig.AutoSystemRoutingTable / DNS 字段从未被读取（路由/DNS
+		// 监听地址分别硬编码在 tun_device_darwin.go / runDNSListener），
+		// 已连同 dnsServers 一起删除。
+		hijackTargets := []string{"0.0.0.0/1", "128.0.0.0/1"}
 		// root 内核经 osascript 拉起，GUI 拿不到管道；停内核靠轮询停止标记文件
 		// （GUI 创建 tun.stop → 本协程发现后清理退出）。
 		go watchStopFile()
 
-		tunGatewayCIDR, tunDNSIP := chooseTunIPv4Config()
-		dnsServers := []string{tunDNSIP}
+		tunGatewayCIDR, _ := chooseTunIPv4Config()
 		SeedTunSelfPrefixes()
 		gateways := []string{tunGatewayCIDR}
 
@@ -665,18 +669,16 @@ func main() {
 		enableIPv6 := ipStrategy != IPStrategyIPv4Only
 		if enableIPv6 {
 			gateways = append(gateways, "fdfe:dcba:9876::1/126")
-			routes = append(routes, "::/0")
+			hijackTargets = append(hijackTargets, "2000::/3")
 		}
 
 		tunCfg := &TunConfig{
-			Name:                   tunName,
-			MTU:                    tunMTU,
-			Gateway:                gateways,
-			DNS:                    dnsServers,
-			AutoSystemRoutingTable: routes,
+			Name:    tunName,
+			MTU:     tunMTU,
+			Gateway: gateways,
 		}
 		log.Printf("[TUN] 配置: device=%s, mtu=%d, addr=%v, routes=%v",
-			tunCfg.Name, tunCfg.MTU, tunCfg.Gateway, tunCfg.AutoSystemRoutingTable)
+			tunCfg.Name, tunCfg.MTU, tunCfg.Gateway, hijackTargets)
 
 		// 在启动 TUN 之前，先启动 -l 指定的本地监听（socks5/http）
 		// 因为 StartTun 内部 select{} 会永久阻塞，之后的代码不会执行
@@ -3026,6 +3028,19 @@ func handleSOCKS5Connect(c net.Conn, target string) {
 }
 
 func handleSOCKS5UDP(c net.Conn, cfgp *ProxyConfig) {
+	// 简易协议（Worker-ECH.js）没有 smux 通道也没有 UDP 分帧能力：往下走到
+	// openUDPStream 必然报「无可用 smux 通道」，关联随即关闭。旧实现先回成功
+	// 应答再静默失败，客户端拿到一个「能发包、永不回包」的黑洞。现在在应答前
+	// 直接回 0x07（Command not supported），客户端立刻得知 UDP 不通并回落
+	// TCP——与 TUN 侧 tun_stack.go 对 simple 协议 UDP 回 ICMP port-unreachable
+	// 同一口径。判据用 != protoSmux 而不是 == protoSimple：protoUnknown（探测
+	// 未落地的极端窗口）同样进不了 smux 路径，一并拒绝。
+	if serverProtocol.Load() != protoSmux {
+		_, _ = c.Write([]byte{0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		log.Printf("[客户端] SOCKS5 UDP ASSOCIATE 已拒绝：当前服务端协议不支持 UDP 转发，请改走 TCP")
+		_ = c.Close()
+		return
+	}
 	host, _, _ := net.SplitHostPort(cfgp.Host)
 	uAddr, _ := net.ResolveUDPAddr("udp", net.JoinHostPort(host, "0"))
 	ul, err := net.ListenUDP("udp", uAddr)

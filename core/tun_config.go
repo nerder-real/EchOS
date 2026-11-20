@@ -10,12 +10,6 @@ type TunConfig struct {
 	MTU int
 
 	// Gateway IP addresses to assign to the TUN interface (e.g. "172.18.0.1/30")
+	// 同时也是内核 DNS 监听地址的来源（runDNSListener 遍历 Gateway，见 tun_dns.go）。
 	Gateway []string
-
-	// DNS servers to push via DHCP on Windows
-	DNS []string
-
-	// AutoSystemRoutingTable contains CIDR prefixes that will be routed through the TUN
-	// (e.g. "0.0.0.0/0" for full tunnel, or specific subnets for split tunnel)
-	AutoSystemRoutingTable []string
 }
