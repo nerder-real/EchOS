@@ -113,15 +113,33 @@ final class StatusBarController: NSObject, NSMenuDelegate {
 
         let ready = state.proxyReady
         let running = state.isRunning
+        let tunActive = state.config.tunMode && running
 
-        // 状态行：一个圆点 + 一句话，不堆细节。蓝色=已接管成功，与图标一致。
+        // 圆点与图标（applyIcon）共用同一个健康判据：接管或 TUN 运行，
+        // 且自检结论够格。两处必须同源，否则圆点与图标会错位。
+        let healthy = (ready || tunActive) && state.trayHealthy
+
+        // 状态文字只描述「现在是什么状态」，不承担健康判断——健康程度
+        // 由圆点/图标表达。这样文字可以直白，不必写「自检未通过」之类
+        // 只有开发才懂的细节。
+        let statusText: String
+        if !running {
+            statusText = "ECH 代理未运行"
+        } else if ready {
+            statusText = "系统代理已接管"
+        } else if tunActive {
+            statusText = "TUN 模式运行中"
+        } else {
+            statusText = "ECH 代理运行中，系统代理未接管"
+        }
+
         let status = NSMenuItem(title: "", action: nil, keyEquivalent: "")
         let dot = NSAttributedString(
-            string: ready ? "● " : "○ ",
-            attributes: [.foregroundColor: Self.color(ready: ready),
+            string: healthy ? "● " : "○ ",
+            attributes: [.foregroundColor: Self.color(ready: healthy),
                          .font: NSFont.systemFont(ofSize: 13)])
         let text = NSAttributedString(
-            string: ready ? "系统代理已接管" : (state.isRunning ? "代理运行中，系统代理未接管" : "ECH 代理未运行"),
+            string: statusText,
             attributes: [.foregroundColor: NSColor.labelColor,
                          .font: NSFont.systemFont(ofSize: 12, weight: .medium)])
         let line = NSMutableAttributedString()

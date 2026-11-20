@@ -1498,7 +1498,11 @@ final class AppState: NSObject, ObservableObject {
         // 这里说的是"系统代理有没有被接管"，跟分流模式里的"全局代理"是两回事，
         // 早先都叫"全局代理"，用户会以为分流模式被改了。
         if config.tunMode {
-            t += " · TUN 模式（系统代理已让位）"
+            // 「系统代理关闭」是 TUN 的固有属性（设计如此，开开关时就该
+            // 知道），不是会变的运行状态——状态行只报有信息量的东西，
+            // 固有属性不重复。对比非 TUN 分支：那里的接管与否是真实运行
+            // 状态（可能失败、可能被抢），才值得显示。
+            t += " · TUN 模式"
         } else {
             t += proxyTakenOver ? " · 已接管系统代理" : " · 未接管系统代理"
         }
@@ -1839,7 +1843,18 @@ final class AppState: NSObject, ObservableObject {
     /// 退出时记录代理是否在运行，供下次启动自动恢复（更新重启也恢复）。
     static let proxyWasRunningKey = "EchOS.proxyWasRunning"
 
+    /// 退出收尾只允许完整跑一遍。正常退出路径上它天然会被调两次
+    /// （quitApp / 关窗退出 / 更新重启先显式调一次，NSApp.terminate 又经
+    /// applicationWillTerminate 再调一次）：第二次纯属重复——再跑一遍
+    /// SystemProxy.restore()（约 20 次 networksetup 子进程，退出多卡 1~2 秒）
+    /// 和 persist()。各项操作结果幂等，所以只需要挡重复，不需要回滚。
+    /// 前提：本 App 未实现 applicationShouldTerminate，terminate 不会被取消，
+    /// 不存在「shutdown 后应用继续活着还需要再收尾」的路径。
+    private var didShutdown = false
+
     func shutdown() {
+        guard !didShutdown else { return }
+        didShutdown = true
         // 退出前快照代理运行状态：下次启动（含自动更新重启）据此自动恢复
         UserDefaults.standard.set(isRunning, forKey: Self.proxyWasRunningKey)
         // 退出前清掉自检结论：新一轮启动会重新自检，残留的失败态不该
