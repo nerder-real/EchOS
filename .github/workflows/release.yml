@@ -31,7 +31,8 @@ jobs:
 
       # 版本号：push 标签时取 GITHUB_REF_NAME（v1.0.0 → 1.0.0）；
       # 手动触发时取输入框版本号（1.0.0 → 标签 v1.0.0）。
-      # 写回 Info.plist，DMG 文件名自动是 EchOS-mac-1.0.0-universal-x64.dmg。
+      # 写回 Info.plist，DMG 文件名自动是 EchOS-mac-1.0.0-universal-x64.dmg，
+      # 产物统一落在 build/（被 .gitignore 忽略）。
       - name: Resolve version
         id: ver
         run: |
@@ -131,4 +132,4 @@ jobs:
           tag_name: ${{ steps.ver.outputs.TAG }}
           name: EchOS ${{ steps.ver.outputs.TAG }}
           body_path: RELEASE_BODY.md
-          files: EchOS-mac-*.dmg
+          files: build/EchOS-mac-*.dmg

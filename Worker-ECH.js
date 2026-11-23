@@ -55,6 +55,10 @@ export default {
 async function handleSession(webSocket) {
   let remoteSocket, remoteWriter, remoteReader;
   let isClosed = false;
+  // ===== 诊断计数（2026-11-22 排查 ZCode 中流断连）：tail 时定位死因用 =====
+  let curTarget = '';
+  let upBytes = 0;   // 客户端 → 目标（已写入远端 socket 的字节）
+  let downBytes = 0; // 目标 → 客户端（已从远端读出的字节）
 
   const cleanup = () => {
     if (isClosed) return;
@@ -72,14 +76,23 @@ async function handleSession(webSocket) {
     try {
       while (!isClosed && remoteReader) {
         const { done, value } = await remoteReader.read();
-        
+
         if (done) break;
         if (webSocket.readyState !== WS_READY_STATE_OPEN) break;
-        if (value?.byteLength > 0) webSocket.send(value);
+        if (value?.byteLength > 0) {
+          downBytes += value.byteLength;
+          webSocket.send(value);
+        }
       }
-    } catch {}
-    
+    } catch (err) {
+      // 远端读取异常（对端 RST / 网络中断）：此前被静默吞掉，tail 看不到死因
+      console.log(`[ECH] REMOTE READ FAIL ${curTarget} up=${upBytes} down=${downBytes} err=${err?.message || err}`);
+    }
+
     if (!isClosed) {
+      if (!isClosed && remoteReader) {
+        console.log(`[ECH] REMOTE EOF ${curTarget} up=${upBytes} down=${downBytes}`);
+      }
       try { webSocket.send('CLOSE'); } catch {}
       cleanup();
     }
@@ -108,6 +121,8 @@ async function handleSession(webSocket) {
   };
 
   const connectToRemote = async (targetAddr, firstFrameData) => {
+    curTarget = targetAddr;
+    console.log(`[ECH] CONNECT ${targetAddr} first=${firstFrameData ? firstFrameData.length : 0}B`);
     const { host, port } = parseAddress(targetAddr);
     const attempts = [null, ...CF_FALLBACK_IPS];
 
@@ -122,6 +137,7 @@ async function handleSession(webSocket) {
 
         remoteWriter = remoteSocket.writable.getWriter();
         remoteReader = remoteSocket.readable.getReader();
+        console.log(`[ECH] CONNECTED ${targetAddr} attempt=${i + 1}/${attempts.length}${attempts[i] ? ' (via ProxyIP)' : ''}`);
 
         // 发送首帧数据
         if (firstFrameData) {
@@ -133,6 +149,7 @@ async function handleSession(webSocket) {
         return;
 
       } catch (err) {
+        console.log(`[ECH] CONNECT FAIL ${targetAddr} attempt=${i + 1}/${attempts.length} err=${err?.message || err}`);
         // 清理失败的连接
         try { remoteWriter?.releaseLock(); } catch {}
         try { remoteReader?.releaseLock(); } catch {}
@@ -171,9 +188,13 @@ async function handleSession(webSocket) {
         }
       }
       else if (data instanceof ArrayBuffer && remoteWriter) {
+        upBytes += data.byteLength;
         await remoteWriter.write(new Uint8Array(data));
       }
     } catch (err) {
+      // 写远端失败 = Worker↔目标 的 socket 在中流被掐：打印目标、已传字节数
+      // 与完整错误，这是「Network connection lost」类断连的唯一观测点
+      console.log(`[ECH] WRITE FAIL ${curTarget} up=${upBytes} down=${downBytes} err=${err?.message || err} stack=${err?.stack?.split('\n')[0] || ''}`);
       try { webSocket.send('ERROR:' + err.message); } catch {}
       cleanup();
     }

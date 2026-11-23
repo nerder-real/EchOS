@@ -394,7 +394,12 @@ func (h *tunConnHandler) handleTCP(r *tcp.ForwarderRequest) {
 	}
 	ep, err := r.CreateEndpoint(&wq)
 	if err != nil {
-		log.Printf("[TUN][栈] CreateEndpoint 失败: %v", err)
+		// 目的地必须打出：此前的失败行不含目标，501 次 "connection was refused"
+		// 全是黑箱，无法定位是哪个应用在 TUN 平面断握手（2026-11-22 排查实录）。
+		// gVisor 语义：performHandshake 收到 App 侧 RST/ICMP 即返回 refused ——
+		// 这条是「应用自己取消/掐断了半开连接」，不是隧道出站失败。
+		log.Printf("[TUN][栈] CreateEndpoint 失败: %v (目标 %s:%d)", err,
+			net.IP(id.LocalAddress.AsSlice()), id.LocalPort)
 		r.Complete(true)
 		return
 	}
@@ -455,9 +460,26 @@ func (h *tunConnHandler) handleTCP(r *tcp.ForwarderRequest) {
 		// 「无可用 smux 通道」—— 现象就是 TUN 网卡建起来了、但一个包都出不去。
 		// dialViaTunnel 内部按 serverProtocol 分流（simple 走每连接新建 WS），
 		// 与本地代理（30000/30001）用的是同一条出站逻辑。
+		// 熔断兜底（2026-11-22）：该目标经隧道反复异常且直连探活通过后，
+		// 直连临时接管 5 分钟。兜底拨号失败则本次仍走隧道——不能比原状更糟。
+		if connBrk.allow(proxyTarget) {
+			if iface := h.getPhysicalInterface(); iface != nil {
+				direct, derr := directDialTCP(target, iface)
+				if derr == nil {
+					log.Printf("[TUN][熔断] %s -> %s (直连兜底接管)", tunPeerAddr(conn), proxyTarget)
+					if initial != nil {
+						direct.Write(initial)
+					}
+					directProxyStream(conn, direct)
+					return
+				}
+			}
+		}
+		dialStart := time.Now()
 		ob, perr := dialViaTunnel(proxyTarget)
 		if perr != nil {
 			log.Printf("[TUN][TCP][proxy] %s -> %s (%s, open failed: %v)", tunPeerAddr(conn), proxyTarget, routeReason, perr)
+			connBrk.record(proxyTarget, target, true, 0)
 			return
 		}
 		log.Printf("[TUN][TCP][proxy] %s -> %s (%s)", tunPeerAddr(conn), proxyTarget, routeReason)
@@ -467,7 +489,15 @@ func (h *tunConnHandler) handleTCP(r *tcp.ForwarderRequest) {
 		// Mac 桥接：route_dial.go 的 relayOutbound 语义与 Win 版 proxyConnStream
 		// 一致（双向 256KB CopyBuffer），出站端放宽为 io.ReadWriteCloser，
 		// 直连与隧道两种出站都能走这里。
-		relayOutbound(conn, ob)
+		up, down, upErr, downErr := relayOutbound(conn, ob)
+		// 短命连接留证 + 熔断计数（2026-11-22 排查）：存活 <2s 的流打日志看死法；
+		// record 按「服务器是否回过字节」判定异常（down=0 即拨通即死），
+		// 快而成功的请求（down>0）不会污染计数。
+		if d := time.Since(dialStart); d < 2*time.Second {
+			log.Printf("[TUN][TCP][proxy] 短命连接 %s -> %s (存活 %dms · 上行 %dB[%v] · 下行 %dB[%v])",
+				tunPeerAddr(conn), proxyTarget, d.Milliseconds(), up, upErr, down, downErr)
+		}
+		connBrk.record(proxyTarget, target, false, down)
 	}()
 }
 

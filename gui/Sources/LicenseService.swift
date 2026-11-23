@@ -237,6 +237,11 @@ final class LicenseService: ObservableObject {
     /// 在途校验：同一时刻至多一个，后来的调用共享同一个结果，而不是各发
     /// 一个请求再赌谁先回来。
     private var inFlightTask: Task<LicenseResult, Never>?
+    /// 在途任务代次号。Task 是 struct，完成回调里没法比对身份——只能靠
+    /// 代次判断「要清理的入口还是不是自己」：A 在途时 B 可能已顶替
+    /// inFlightTask，A 完成后的清理若无条件置 nil，会把 B 的合并入口抹掉，
+    /// 第三个请求就绕过合并并发直发了。
+    private var inFlightGeneration = 0
     /// 授权网络操作（verify/activate）的串行链：前一趟没落地，后一趟不出发。
     /// 两个并发请求，旧的那个晚回来会把刚生效的新状态（比如吊销）用旧答案
     /// 覆盖回去——串行之后时序自然有序。
@@ -388,9 +393,14 @@ final class LicenseService: ObservableObject {
         if !source.isEmpty { authLog("校验触发来源：\(source)") }
         let task = chained { await self.verifyWithRetry() }
         inFlightTask = task
+        inFlightGeneration += 1
+        let generation = inFlightGeneration
         Task { [weak self] in
             _ = await task.value
-            self?.inFlightTask = nil
+            // 代次不匹配说明入口已被更晚的请求顶替，不能动它的清理权
+            if self?.inFlightGeneration == generation {
+                self?.inFlightTask = nil
+            }
         }
         return task
     }

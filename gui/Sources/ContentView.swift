@@ -44,7 +44,10 @@ struct ContentView: View {
             // 用户看到的就是「弹窗了却不断网」——留在主界面由状态栏红字提示。
             if !license.bootstrapped {
                 bootPage
-            } else if license.uiLocked {
+            } else if license.uiLocked || license.stage == .notConfigured {
+                // 未配置授权（本地开发包无授权地址）按用户口径停留在授权页：
+                // 主页面状态位只出现授权有效类标识，不出现「未配置授权」。
+                // 本地开发要进主界面调试时，配置 ~/.echos-build-license 重打包。
                 ActivationView()
             } else {
                 mainContent
@@ -204,6 +207,15 @@ struct ContentView: View {
         } message: {
             Text(app.alertMessage ?? "")
         }
+        // 自定义规则的轻量提示（如已存在空行时拒绝新增），独立标题不干扰出错弹窗
+        .alert("规则", isPresented: Binding(
+            get: { app.ruleHint != nil },
+            set: { if !$0 { app.ruleHint = nil } }
+        )) {
+            Button("好", role: .cancel) { app.ruleHint = nil }
+        } message: {
+            Text(app.ruleHint ?? "")
+        }
         // 端口被占用：问一句是否强制结束占用进程后继续启动
         .alert("端口被占用", isPresented: Binding(
             get: { app.pendingPortConflict != nil },
@@ -290,11 +302,11 @@ struct ContentView: View {
 
     /// 隐藏探针测出的内容理想高度：展开 = 内容 + 日志槽位，折叠 = 内容。
     /// 窗口高度始终贴着这个值，展开/折叠/规则变化都由它驱动，不再手算各种增量。
-    @State private var contentIdealHeight: CGFloat = 847
+    @State private var contentIdealHeight: CGFloat = 721
 
     /// 内容理想高度的 PreferenceKey，由隐藏探针上报
     struct ContentHeightKey: PreferenceKey {
-        static var defaultValue: CGFloat = 847
+        static var defaultValue: CGFloat = 721
         static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
             value = nextValue()
         }
@@ -325,8 +337,20 @@ struct ContentView: View {
             screenMaxH = maxH
             if h > maxH { h = maxH }
 
-            AppDelegate.minContentHeight = h
-            win.minSize = NSSize(width: AppDelegate.minContentWidth, height: h)
+            // minContentHeight / minSize 都是「内容高度」，h 是 frame 高度。
+            // 之前把 frame 高度写进内容口径，窗口下限被悄悄抬高 83pt，
+            // 也是启动尺寸对不上的原因之一。
+            AppDelegate.minContentHeight = max(0, h - titlebar)
+            AppDelegate.rememberedMainFrameHeight = h
+            win.minSize = NSSize(width: AppDelegate.minContentWidth,
+                                 height: AppDelegate.minContentHeight)
+
+            // 高度已经等于目标：尺寸和位置都别动。启动页/授权页按记忆高度
+            // 铺开后，切进主页面就走这里，不再 resize/重居中造成那一下跳动。
+            if abs(current - h) <= 4 {
+                lastSetHeight = h
+                return
+            }
 
             // 手动拉伸保护：只有用户真拖过窗口（windowDidEndLiveResize 记下的
             // 高度）才保持用户拉高的高度；内容自己变矮但窗口没跟上时不算
@@ -334,24 +358,22 @@ struct ContentView: View {
             if !collapsed {
                 let userH = AppDelegate.lastUserResizeHeight
                 if userH > 0 && abs(current - userH) <= 2 && h <= current + 1 {
-                    // 窗口停在用户拖过的位置：保持原样，只更新最小高度并重新居中。
+                    // 窗口停在用户拖过的位置：保持原样，也不重新居中。
                     // 内容若是已经超过这个高度（h > current），就不保持、跟着长。
-                    centerWindow(screen: screen, height: current)
                     lastSetHeight = h
-                    return
-                }
-
-                // 高度没变化：只重新居中，不折腾尺寸
-                if lastSetHeight > 0 && abs(current - h) <= 4 {
-                    centerWindow(screen: screen, height: current)
                     return
                 }
             }
 
             var f = win.frame
             f.size.height = h
-            win.setFrame(f, display: true, animate: false)
-            centerWindow(screen: screen, height: h)
+            // 高度变化后在可见区内垂直居中(2026-11-22 设计定稿):顶/底
+            // 空隙永远均分,菜单栏与 Dock 两侧都留足。居中与 resize 合并
+            // 同一次 setFrame(此前 resize 与 centerWindow 两次动画互相打断)。
+            if let vf = win.screen?.visibleFrame {
+                f.origin.y = vf.minY + (vf.height - f.size.height) / 2
+            }
+            win.setFrame(f, display: true, animate: true)
             lastSetHeight = h
         }
     }
@@ -728,12 +750,20 @@ struct ContentView: View {
                         .font(.system(size: 10.5))
                         .foregroundColor(.orange)
                 }
+                // 入口统一放在标题「自定义分流规则」后：规则条数变化、清空、
+                // 折叠/展开都不影响它，规则待生效时始终可见可点。
                 if app.rulesDirty {
-                    Label("待重启", systemImage: "arrow.clockwise")
-                        .font(.system(size: 10.5))
-                        .foregroundColor(.orange)
+                    Button {
+                        Task { await app.applyRules() }
+                    } label: {
+                        Label("待生效·点此重启应用", systemImage: "arrow.clockwise")
+                            .font(.system(size: 10.5))
+                    }
+                    .controlSize(.mini)
+                    .buttonStyle(.bordered)
+                    .tint(.orange)
+                    .help("点击立即重启代理内核应用规则（会短暂断开）")
                 }
-
                 Spacer()
 
                 Button {
@@ -815,17 +845,14 @@ struct ContentView: View {
                 Text("点右上角「添加规则」，选类型后填域名，或直接挑一个网站分类")
                     .font(.system(size: 11))
                     .foregroundColor(.secondary)
-            } else if app.rulesDirty {
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .font(.system(size: 11)).foregroundColor(.orange)
-                Text("规则已保存，重启代理才生效")
-                    .font(.system(size: 11)).foregroundColor(.orange)
-                Button("立即重启") { Task { await app.applyRules() } }
-                    .controlSize(.small)
             } else {
-                Image(systemName: "checkmark.circle.fill")
-                    .font(.system(size: 10.5)).foregroundColor(.green)
-                Text(app.isRunning ? "规则已生效" : "规则已保存，启动代理后生效")
+                // 底部只讲状态，不再放应用入口：入口统一在标题栏「自定义分流规则」后。
+                Image(systemName: app.rulesDirty ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
+                    .font(.system(size: 10.5))
+                    .foregroundColor(app.rulesDirty ? .orange : .green)
+                Text(app.rulesDirty
+                     ? "规则已保存，待重启后生效"
+                     : (app.isRunning ? "规则已生效" : "规则已保存，启动代理后生效"))
                     .font(.system(size: 10.5)).foregroundColor(.secondary)
             }
             Spacer()
@@ -1011,19 +1038,19 @@ struct ContentView: View {
                 ScrollViewReader { proxy in
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 1) {
-                            ForEach(Array(app.displayedLines.enumerated()), id: \.offset) { idx, line in
-                                Text(line)
+                            ForEach(app.displayedLines) { line in
+                                Text(line.text)
                                     .font(.system(size: 10.5, design: .monospaced))
-                                    .foregroundColor(color(for: line))
+                                    .foregroundColor(color(for: line.text))
                                     .textSelection(.enabled)
                                     .frame(maxWidth: .infinity, alignment: .leading)
-                                    .id(idx)
+                                    .id(line.id)
                             }
                         }
                     }
-                    .onChange(of: app.logLines.count) { _ in
-                        if let last = app.logLines.indices.last {
-                            proxy.scrollTo(last, anchor: .bottom)
+                    .onChange(of: app.displayedLines.last?.id) { _ in
+                        if let last = app.displayedLines.last {
+                            proxy.scrollTo(last.id, anchor: .bottom)
                         }
                     }
                 }

@@ -180,21 +180,26 @@ func dialViaTunnel(target string) (*outbound, error) {
 
 // relayOutbound 在客户端连接和出站连接之间双向转发，语义与 proxyConnStream 一致，
 // 区别只是出站端放宽成了 io.ReadWriteCloser，好让直连的 net.Conn 也能走这里。
-func relayOutbound(c net.Conn, ob *outbound) {
+// relayOutbound 双向转发。返回上下行字节数与各自错误：调用方（TUN 路径的
+// 短命连接诊断/熔断计数）据此判断「谁先断、断前传了多少」——
+// 上行 = App→出站（读 App / 写隧道）；下行 = 出站→App（读隧道 / 写 App）。
+// 错误文本自带方向（net.OpError 含 read/write 与地址），nil 表示干净 EOF。
+// x-tunnel.go 的三处本地代理调用点不消费返回值，行为与原来完全一致。
+func relayOutbound(c net.Conn, ob *outbound) (up, down int64, upErr, downErr error) {
 	done := make(chan struct{}, 2)
 	// 转发缓冲放大到 256KB：io.Copy 默认 32KB，大流量下系统调用太频繁，
 	// 放大后一次搬更多字节，吞吐更稳（与 WS 读写缓冲 256KB 对齐）。
 	go func() {
-		n, err := io.CopyBuffer(ob.rw, c, make([]byte, 256*1024))
+		up, upErr = io.CopyBuffer(ob.rw, c, make([]byte, 256*1024))
 		if relayDiag {
-			log.Printf("[诊断] 上行结束 up=%d err=%v", n, err)
+			log.Printf("[诊断] 上行结束 up=%d err=%v", up, upErr)
 		}
 		done <- struct{}{}
 	}()
 	go func() {
-		n, err := io.CopyBuffer(c, ob.rw, make([]byte, 256*1024))
+		down, downErr = io.CopyBuffer(c, ob.rw, make([]byte, 256*1024))
 		if relayDiag {
-			log.Printf("[诊断] 下行结束 down=%d err=%v", n, err)
+			log.Printf("[诊断] 下行结束 down=%d err=%v", down, downErr)
 		}
 		done <- struct{}{}
 	}()
@@ -202,6 +207,7 @@ func relayOutbound(c net.Conn, ob *outbound) {
 	_ = ob.rw.Close()
 	_ = c.Close()
 	<-done
+	return
 }
 
 // logRouteEvent 打一条能看出走了哪条路的日志

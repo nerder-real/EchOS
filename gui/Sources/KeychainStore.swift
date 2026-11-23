@@ -14,7 +14,12 @@ enum KeychainStore {
             kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock,
             kSecValueData as String: Data(password.utf8),
         ]
-        SecItemAdd(query as CFDictionary, nil)
+        let status = SecItemAdd(query as CFDictionary, nil)
+        // 写失败不能无声无息：用户以为密码已存好，下次 WebDAV 备份才发现
+        // 没凭据。至少落一行日志留痕，便于定位是钥匙串权限还是系统状态问题。
+        if status != errSecSuccess {
+            LogFile.write("WebDAV 密码写入钥匙串失败（OSStatus \(status)）")
+        }
     }
 
     static func read(account: String) -> String? {

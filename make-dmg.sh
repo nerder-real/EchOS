@@ -9,8 +9,8 @@ VERSION=$(defaults read "$APP/Contents/Info.plist" CFBundleShortVersionString 2>
 # 只想打单一架构时传 ARCH=x64 或 ARCH=arm64（需先用 UNIVERSAL=0 ./build.sh 编译）。
 ARCH="${ARCH:-universal-x64}"
 RWDMG="$ROOT/build/EchOS-mac-$VERSION-$ARCH-rw.dmg"
-# 成品 DMG 放项目根目录，方便直接分发/测试；中间临时 rw.dmg 留在 build/。
-DMG="$ROOT/EchOS-mac-$VERSION-$ARCH.dmg"
+# App 与 DMG 产物统一放 build/，该目录已被 .gitignore 忽略，避免误传仓库。
+DMG="$ROOT/build/EchOS-mac-$VERSION-$ARCH.dmg"
 STAGE="/tmp/echos-dmg-stage"
 MNT="/tmp/echos-dmg-mnt"
 # 卷名带版本号：Finder 按卷名缓存窗口状态，同名卷会沿用上次打开的布局。
@@ -35,7 +35,7 @@ fi
 if [ -f "$ROOT/assets/icon.svg" ]; then
   VOLICON_SVG="/tmp/echos-volicon.svg"
   sed 's/rx="[0-9]*" //' "$ROOT/assets/icon.svg" > "$VOLICON_SVG"
-  qlmanage -t -s 1024 -o /tmp "$VOLICON_SVG" >/dev/null 2>&1
+  qlmanage -t -s 1024 -o /tmp "$VOLICON_SVG" >/dev/null 2>&1 || true
   VOLICON_PNG="/tmp/volicon.svg.png"
   if [ -f "$VOLICON_PNG" ]; then
     mkdir -p /tmp/echos-volicon.iconset

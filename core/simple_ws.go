@@ -250,11 +250,14 @@ var errEdgeUnreachable = errors.New("边缘不可达")
 //   - 只存裸 WS，借出现场 CONNECT，失败立刻回退全新拨号，绝不会把死连接
 //     当成可用链路交付；
 //   - 借出后等 CONNECTED 只给 2s（全新拨号是 8s），死连接快速暴露；
-//   - TTL 20s：远小于 CF 对空闲 WS 的清理周期，过期直接丢弃；
-//   - 后台补货单飞，池上限 3 条，不会形成建连风暴。
+//   - TTL 60s：仍远小于 CF 对空闲 WS 的 ~120s 清理周期，过期直接丢弃
+//     （2026-11-22 从 20s 放宽：20s 的池子一过 TTL 就空，所有连接被迫
+//     交全额建连开销 0.7s+，把 ZCode 这类预算 0.4~1s 的严超时客户端全部
+//     打出"拨通即死"——见 tun_breaker.go 头注释的排查实录）；
+//   - 池上限 16、补货并发 8：TUN 高频重试/视频分段场景下 6 条入不敷出。
 const (
-	wsPoolCap            = 6
-	wsPoolTTL            = 20 * time.Second
+	wsPoolCap            = 16
+	wsPoolTTL            = 60 * time.Second
 	wsPoolConnectTimeout = 2 * time.Second
 )
 
@@ -308,7 +311,7 @@ func (p *ECHPool) wsPoolPut(ws *websocket.Conn) {
 const (
 	// 单轮最多并发补几条。池上限 6，故 6 足够一次填满；不取更大值，
 	// 避免少数极端场景（大量连接瞬间关闭）把 CF 边缘打出瞬时并发。
-	wsPoolBurst = 6
+	wsPoolBurst = 8
 )
 
 func (p *ECHPool) wsPoolKick() {

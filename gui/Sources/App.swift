@@ -24,7 +24,7 @@ struct ECHApp: App {
                     }
                 }
         }
-        .defaultSize(width: 735, height: AppDelegate.minContentHeight)
+        .defaultSize(width: 735, height: AppDelegate.defaultMainFrameHeight)
         .commands {
             CommandGroup(replacing: .newItem) {}
         }
@@ -98,14 +98,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             guard let win = NSApp.windows.first(where: { $0.contentView != nil }) else { return }
             // 只定宽度和最小尺寸；高度交给 ContentView 的 syncWindowHeight
             // 按当前内容算，免得两处各设一套值互相覆盖。
-            // 这里用 minContentHeight（基准 819）兜底铺开，与 defaultSize/minSize
+            // 这里用 minContentHeight（基准 721）兜底铺开，与 defaultSize/minSize
             // 保持一致，不再单写一个魔法数字 —— 那只会让三处尺寸互相打架。
             win.setContentSize(NSSize(width: Self.minContentWidth, height: Self.minContentHeight))
+            // 已记住主页面高度时，启动页/授权页直接按这个 frame 高铺开。
+            // 之后切进主页面算出的目标高度与它相同，就不会再 resize/重居中。
+            let remembered = Self.rememberedMainFrameHeight
+            let wanted = remembered > 600 ? remembered : Self.defaultMainFrameHeight
+            let cap = (win.screen?.visibleFrame.height ?? 1400) - 40
+            let target = min(wanted, max(cap, 600))
+            if abs(win.frame.height - target) > 1 {
+                var f = win.frame
+                f.size.height = target
+                win.setFrame(f, display: true)
+            }
             // minSize 只挡"窗口被拖得太小"：拉到内容所需高度
             // 就停，底部操作行和日志不会被窗口底边盖住
             win.minSize = NSSize(width: Self.minContentWidth, height: Self.minContentHeight)
             win.delegate = self
-            win.center()
+            // 启动定位与高度同步同一规则:可见区内垂直水平居中
+            // (win.center() 会放得「略高于中心」,顶边贴菜单栏的来源)
+            if let vf = win.screen?.visibleFrame {
+                win.setFrameOrigin(NSPoint(x: vf.midX - win.frame.width / 2,
+                                           y: vf.minY + (vf.height - win.frame.height) / 2))
+            } else {
+                win.center()
+            }
             win.makeKeyAndOrderFront(nil)
             // 内容区顶部已经有居中的 EchOS 标题，标题栏再显示一次就重复了
             win.titleVisibility = .hidden
@@ -139,11 +157,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         _ = AppState.runModalTopCentered(alert)
     }
 
-    /// ContentView 算出的内容所需高度。窗口手动缩放时不能比它矮，
-    /// 否则底部操作行和日志会被窗口底边盖住。
-    /// 819 = 原基准 758 + 标题栏留白（上 50 + 下 35，净增 61pt）；
-    /// 探针随后按实际内容修正，初值对齐终值避免启动页→主页面之间的高度跳变。
-    static var minContentHeight: CGFloat = 819
+    /// ContentView 算出的内容所需高度（不含透明标题栏/工具区）。
+    /// 实测主页面内容 721pt，窗口 frame 约 804pt（系统额外加 83pt）。
+    /// 这个值必须和实际内容一致：启动页/授权页按它铺开，切主页面才不会跳。
+    /// 探针随后按真实内容修正，修正值会写进 rememberedMainFrameHeight。
+    static var minContentHeight: CGFloat = 721
+
+    /// 首次运行（没有记忆高度时）直接按主页面实测 frame 高铺开。
+    /// 不能拿内容高 721 当窗口高：那会让启动页比主页面矮 83pt，
+    /// 自检通过后仍会跳一次。
+    static let defaultMainFrameHeight: CGFloat = 804
 
     /// 窗口最小宽度。SwiftUI 的 frame(minWidth:) 只约束内容布局、拦不住
     /// 程序性缩放，AppKit 侧的 minSize 又只在启动时设一次（自动更新重启
@@ -155,6 +178,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     /// 程序 setFrame 不会触发。syncWindowHeight 靠它区分「用户拉高」
     /// 和「内容自己变矮但窗口没跟上」，避免把后者误当成前者而拒绝缩回。
     static var lastUserResizeHeight: CGFloat = 0
+
+    /// 上一次主页面稳定后的窗口 frame 高度。启动时直接按它铺窗口，
+    /// 让启动页/授权页与主页面用同一个尺寸，消除自检通过后的那一下跳动。
+    private static let mainFrameHeightKey = "EchOS.mainWindowFrameHeight"
+    static var rememberedMainFrameHeight: CGFloat {
+        get {
+            let v = UserDefaults.standard.double(forKey: mainFrameHeightKey)
+            return v > 0 ? CGFloat(v) : 0
+        }
+        set { UserDefaults.standard.set(Double(newValue), forKey: mainFrameHeightKey) }
+    }
 
     // 拖拽窗口时的硬约束：宽度不低于 minContentWidth，高度不低于内容所需
     // 高度（minSize 之外的兜底——minSize 只在启动时设一次，靠不住）
@@ -170,6 +204,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     @objc func windowDidEndLiveResize(_ notification: Notification) {
         if let win = notification.object as? NSWindow {
             Self.lastUserResizeHeight = win.frame.height
+            Self.rememberedMainFrameHeight = win.frame.height
         }
     }
 

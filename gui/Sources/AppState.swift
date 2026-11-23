@@ -12,6 +12,13 @@ struct PortConflict: Identifiable {
     var pid: Int
 }
 
+/// 日志行：稳定 id(视图复用)+ 严重度档位(显示过滤用,入列时算好)。
+struct LogLine: Identifiable {
+    let id = UUID()
+    let text: String
+    let rank: Int
+}
+
 @MainActor
 final class AppState: NSObject, ObservableObject {
     @Published var config: AppConfig
@@ -35,6 +42,11 @@ final class AppState: NSObject, ObservableObject {
     /// 本会话确实启动过 root 内核（TUN）且尚未停止。stop()/shutdown()
     /// 据此选择停止路径——config.tunMode 会先于停止动作被改写，不可信。
     var rootKernelActive = false
+    /// TUN 内核日志跟随：tun-kernel.log 是 root 内核直写的（无管道可读），
+    /// 轮询追加喂进界面日志 —— TUN 下的失败（拨号被拒/短命连接/熔断）必须
+    /// 在「运行日志」里可见，不能让用户去开另一个文件才能知道出了事。
+    private var tunLogTailTimer: Timer?
+    private var tunLogTailOffset: UInt64 = 0
     /// 最近一次自检里"必须经隧道"的探针（国外站点）是否失败。
     /// 对齐 Win 方案A（用户拍板）：主状态灯只回答"代理生效了吗"——
     /// 运行中一律绿，只有隧道探针失败才红；国内直连探针失败不红
@@ -51,11 +63,11 @@ final class AppState: NSObject, ObservableObject {
         default: return false
         }
     }
-    @Published var logLines: [String] = []
+    @Published var logLines: [LogLine] = []
     /// 自检记录单独一份，切到"自检记录"视图时显示这个
-    @Published var checkLines: [String] = []
+    @Published var checkLines: [LogLine] = []
     /// 授权记录单独一份（校验/激活/吊销的结论流水），切到"授权记录"视图时显示
-    @Published var authLines: [String] = []
+    @Published var authLines: [LogLine] = []
     @Published var systemProxySummary: String = ""
     /// 刚新增/重建了还没起名的服务器，界面据此立刻弹起命名框
     @Published var needsNameInput = false
@@ -78,6 +90,9 @@ final class AppState: NSObject, ObservableObject {
     /// 菜单栏触发启动失败时窗口可能关着，日志看不到，必须弹窗
     @Published var alertMessage: String?
     @Published var alertTitle = "出错"
+    /// 自定义分流规则的轻量提示（nil = 不弹）。与 alertMessage 分开，
+    /// 避免改掉全局 alert 标题、也不干扰启动失败那类真正的出错弹窗。
+    @Published var ruleHint: String?
     /// 启动时发现监听端口被占用，待用户确认是否强制结束占用进程（nil = 无待处理）
     @Published var pendingPortConflict: PortConflict?
     /// DMG 下载进度 0~1；nil = 没有在下载
@@ -292,6 +307,12 @@ final class AppState: NSObject, ObservableObject {
         var out = config
         out.servers = config.servers
             .compactMap { savedServers[$0.id] }
+        // 写盘兜底：空规则（目标为空）内核本来也忽略（kernelCondition 为 nil），
+        // 写进配置只会让重启后残留一堆空行。内存里仍保留编辑中的空行供继续填写，
+        // 这里只过滤写出去的副本，不动 config.customRules 本体。
+        out.customRules = config.customRules.filter {
+            !$0.target.trimmingCharacters(in: .whitespaces).isEmpty
+        }
         out.save()
     }
 
@@ -421,11 +442,20 @@ final class AppState: NSObject, ObservableObject {
     @Published var rulesDirty = false
 
     func addRule() {
+        // 已有未填的空规则就不再新增：连点会堆出一堆空行，且空规则
+        // 内核忽略（kernelCondition 为 nil），留着只会误导。等填好当前这条再点。
+        let hasBlank = config.customRules.contains {
+            $0.target.trimmingCharacters(in: .whitespaces).isEmpty
+        }
+        if hasBlank {
+            ruleHint = "已有一条未填写的规则，请先把目标填好再添加下一条"
+            return
+        }
         // 规则是 App 级全局参数（对齐 Win），不挂在某台服务器名下
         config.customRules.append(CustomRule())
         persist()
         if isRunning { rulesDirty = true }
-        log("[系统] 已新增自定义分流规则\(isRunning ? "（运行中，点「立即重启」生效）" : "")")
+        log("[系统] 已新增自定义分流规则\(isRunning ? "（运行中，点「待生效·点此重启应用」生效）" : "")")
     }
 
     func removeRule(_ id: UUID) {
@@ -515,7 +545,7 @@ final class AppState: NSObject, ObservableObject {
     /// 弹窗文案要短：SwiftUI 的 alert 长了会换行、排版不居中，
     /// 所以这里每一条都压在一行以内。
     private func serverFailureHint() -> String? {
-        let hints = Array(logLines.suffix(30)).joined(separator: "\n")
+        let hints = Array(logLines.suffix(30)).map(\.text).joined(separator: "\n")
         let lower = hints.lowercased()
         if lower.contains("认证失败")
             || lower.contains("token 不匹配")
@@ -562,7 +592,7 @@ final class AppState: NSObject, ObservableObject {
             // 自检结论完全走单独通道，不进运行日志。
             // 它是一次次的结论，混进连续流水只会把两边都搅浑。
             if line.contains("[自检]") {
-                checkLines.append(line)
+                checkLines.append(LogLine(text: line, rank: LogLevel.classify(line).rank))
                 LogFile.writeCheck(line)
                 if checkLines.count > 300 {
                     checkLines.removeFirst(checkLines.count - 300)
@@ -574,7 +604,7 @@ final class AppState: NSObject, ObservableObject {
             // 它是「这台机器此刻凭什么能用」的凭据，用户报障第一句话就是看它，
             // 既不能被级别开关吃掉，也不能淹进连接流水。文件累积保留。
             if line.contains("[授权]") {
-                authLines.append(line)
+                authLines.append(LogLine(text: line, rank: LogLevel.classify(line).rank))
                 LogFile.writeAuth(line)
                 if authLines.count > 1000 {
                     authLines.removeFirst(authLines.count - 1000)
@@ -582,11 +612,10 @@ final class AppState: NSObject, ObservableObject {
                 continue
             }
 
-            // 文件留全量，界面按级别过滤：文件是用来事后排查的，
-            // 界面是用来当下扫一眼的，两者详略要求不同。
+            // 文件留全量，界面按级别过滤（2026-11-22 语义改为显示过滤器：
+            // 记录永远全量——否则切级别时记录会丢）；rank 入列时算好一次。
             LogFile.write(line)
-            guard LogLevel.classify(line).rank <= config.logLevel.rank else { continue }
-            logLines.append(line)
+            logLines.append(LogLine(text: line, rank: LogLevel.classify(line).rank))
         }
         if logLines.count > maxLogLines {
             logLines.removeFirst(logLines.count - maxLogLines)
@@ -595,18 +624,77 @@ final class AppState: NSObject, ObservableObject {
 
     /// 清空日志：界面和文件一起清。
     /// 只清界面而留着文件，用户会以为已经清干净了，下次打开日志文件又是一堆旧记录。
+    // MARK: - TUN 内核日志跟随
+
+    /// 开始跟随 tun-kernel.log：1 秒轮询追加部分，原样喂进界面日志与文件。
+    /// 内核行自带时间戳与 [TUN] 前缀，级别分类照常生效（含超时/失败关键词的
+    /// 行会归入「仅错误」档可见）。
+    private func startTunLogTail() {
+        tunLogTailOffset = 0
+        stopTunLogTail()
+        let timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            MainActor.assumeIsolated {
+                self.pumpTunKernelLog()
+            }
+        }
+        tunLogTailTimer = timer
+        pumpTunKernelLog()
+    }
+
+    private func stopTunLogTail() {
+        tunLogTailTimer?.invalidate()
+        tunLogTailTimer = nil
+        tunLogTailOffset = 0
+    }
+
+    /// 从上次偏移读 tun-kernel.log 的追加部分喂进日志。文件被重建/截断
+    ///（清空标记、内核重启）时偏移自动归零。
+    private func pumpTunKernelLog() {
+        let url = TunLauncher.kernelLogURL
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        guard let fh = try? FileHandle(forReadingFrom: url) else { return }
+        defer { try? fh.close() }
+        let size = (try? fh.seekToEnd()) ?? 0
+        if size < tunLogTailOffset { tunLogTailOffset = 0 }
+        guard size > tunLogTailOffset else { return }
+        try? fh.seek(toOffset: tunLogTailOffset)
+        let data = (try? fh.read(upToCount: Int(size - tunLogTailOffset))) ?? Data()
+        tunLogTailOffset = size
+        guard let text = String(data: data, encoding: .utf8) else { return }
+        for raw in text.split(separator: "\n", omittingEmptySubsequences: true) {
+            let line = String(raw)
+            // 启动脚本的 nohup 噪音行不进日志
+            if line.hasPrefix("nohup:") { continue }
+            log(line)
+        }
+    }
+
     func clearLog() {
         logLines.removeAll()
         checkLines.removeAll()
         authLines.removeAll()
         LogFile.clear()
+        // tun-kernel.log 由 root 内核直写（root 所有），分两种情况清：
+        //  运行中 → 投递清理标记，内核轮询自行 truncate（O_APPEND 写入
+        //            自然回新 EOF）；未运行 → 直接删除（目录属主是用户）。
+        let tunLog = TunLauncher.kernelLogURL
+        if rootKernelActive {
+            FileManager.default.createFile(atPath: TunLauncher.clearLogMarkerURL.path, contents: nil)
+        } else if FileManager.default.fileExists(atPath: tunLog.path) {
+            try? FileManager.default.removeItem(at: tunLog)
+        }
     }
 
-    /// 当前视图该显示哪一份记录
-    var displayedLines: [String] {
+    /// 当前视图该显示哪一份记录（2026-11-22 语义：级别=显示过滤器，
+    /// 记录永远全量）。关闭=不显示；仅错误/警告=严格按档位取行；
+    /// 全部=除自检/授权外全量；自检/授权册独立成视图。
+    var displayedLines: [LogLine] {
         switch config.logLevel {
+        case .off:       return []
         case .checkOnly: return checkLines
         case .authOnly:  return authLines
+        case .error, .warning: return logLines.filter { $0.rank == config.logLevel.rank }
         default:         return logLines
         }
     }
@@ -765,7 +853,7 @@ final class AppState: NSObject, ObservableObject {
                 // 从内核日志里找"address already in use / bind"这类关键字，
                 // 给出明确的修复提示，而不是只显示一个生硬的"状态码"。
                 if proc.terminationStatus != 0 {
-                    let hints = Array(me.logLines.suffix(20)).joined(separator: "\n")
+                    let hints = Array(me.logLines.suffix(20)).map(\.text).joined(separator: "\n")
                     let lower = hints.lowercased()
                     if lower.contains("address already in use")
                         || lower.contains("cannot bind")
@@ -963,6 +1051,7 @@ final class AppState: NSObject, ObservableObject {
         }
         log("[TUN] root 内核已启动，等待代理端口就绪（最长 90 秒）…")
         rootKernelActive = true
+        startTunLogTail()
         isStarting = true
         checkState = .running
         refreshStatusText()
@@ -976,6 +1065,7 @@ final class AppState: NSObject, ObservableObject {
             self.proxyTakenOver = false
             self.proxyReady = false
             self.rootKernelActive = false
+            self.stopTunLogTail()
             self.log("[系统] TUN 内核已退出")
             self.refreshStatusText()
         }
@@ -1164,6 +1254,7 @@ final class AppState: NSObject, ObservableObject {
             checkState = .idle
             tunProbeFailed = false
             rootKernelActive = false
+            stopTunLogTail()
             KernelPID.clear()
             refreshStatusText()
             return
@@ -1870,6 +1961,7 @@ final class AppState: NSObject, ObservableObject {
             }
             TunLauncher.stopExitMonitor()
             rootKernelActive = false
+            stopTunLogTail()
         }
         // proxyTakenOver：代理模式接管态，退出时还原备份。
         // SystemProxy.isActive：TUN 让位后也是 true（清空态 + 备份保留），

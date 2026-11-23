@@ -82,7 +82,7 @@ if [ -n "${ECH_LICENSE_URL:-}" ]; then
   PLIST="$APP/Contents/Info.plist"
   /usr/libexec/PlistBuddy -c "Delete :EchOSLicenseURL" "$PLIST" 2>/dev/null || true
   /usr/libexec/PlistBuddy -c "Add :EchOSLicenseURL string '$ECH_LICENSE_URL'" "$PLIST"
-  echo "    授权服务已注入：$ECH_LICENSE_URL"
+  echo "    授权服务已注入（地址不回显）"
 fi
 # 分流数据（跳过中国大陆模式要用）
 for d in geoip geosite; do

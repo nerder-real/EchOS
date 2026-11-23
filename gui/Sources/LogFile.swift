@@ -64,10 +64,10 @@ enum LogFile {
     private static var written = 0
 
     static func write(_ line: String) {
-        guard handle != nil else { return }
-        // 落盘放到后台队列，别拖慢界面刷新
+        // 落盘放到后台队列，别拖慢界面刷新。handle 的判断也必须放进队列：
+        // 它是后台队列正在读写的静态变量，在调用线程读与队列内写构成数据竞争。
         queue.async {
-            guard let data = (line + "\n").data(using: .utf8) else { return }
+            guard handle != nil, let data = (line + "\n").data(using: .utf8) else { return }
             try? handle?.write(contentsOf: data)
             written += data.count
             if written >= maxFileSize {
@@ -94,8 +94,9 @@ enum LogFile {
 
     /// 写一行自检记录（带时间戳，方便回看是哪次的结果）
     static func writeCheck(_ line: String) {
-        guard checkHandle != nil else { return }
         queue.async {
+            // handle 的判断在队列内（与 write 同一口径：静态变量不跨线程读）
+            guard checkHandle != nil else { return }
             let f = DateFormatter()
             f.dateFormat = "MM-dd HH:mm:ss"
             let stamped = "[\(f.string(from: Date()))] " + line + "\n"
@@ -116,8 +117,8 @@ enum LogFile {
     /// 记录一致：累积保留、超过 1MB 就地截断 —— 授权事件（启动校验/定时
     /// 复查/激活）频次很低，1MB 足够存几个月。
     static func writeAuth(_ line: String) {
-        guard authHandle != nil else { return }
         queue.async {
+            guard authHandle != nil else { return }
             let f = DateFormatter()
             f.dateFormat = "MM-dd HH:mm:ss"
             let stamped = "[\(f.string(from: Date()))] " + line + "\n"
@@ -162,10 +163,23 @@ enum LogFile {
             try? handle?.close()
             try? checkHandle?.close()
             try? authHandle?.close()
+            // 置 nil 也必须在队列内完成：这三个变量是后台写队列的工作状态，
+            // 在队列外置 nil 与 write/writeCheck/writeAuth 构成数据竞争。
+            handle = nil
+            checkHandle = nil
+            authHandle = nil
         }
-        handle = nil
-        checkHandle = nil
-        authHandle = nil
+    }
+
+    /// 读取累积型日志（自检/授权）的末尾若干行。文件上限 1MB，整读没有压力。
+    /// 这两个文件当初设计成"累积保留、回看历史几次结果才有意义"，但界面视图
+    /// 此前只显示本次会话——换包/重启后历史躺在文件里，界面上却一片空白。
+    /// 启动时把末尾灌进视图，新会话的记录继续往后追加。
+    static func readTail(_ url: URL, maxLines: Int) -> [String] {
+        guard let data = try? Data(contentsOf: url),
+              let text = String(data: data, encoding: .utf8) else { return [] }
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
+        return lines.count > maxLines ? Array(lines.suffix(maxLines)) : lines
     }
 
     /// 日志文件大小，界面上显示用

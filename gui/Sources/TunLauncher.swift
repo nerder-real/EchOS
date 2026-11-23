@@ -43,6 +43,9 @@ enum TunLauncher {
     static var runScriptURL: URL { scriptDir.appendingPathComponent("tun-run.sh") }
     static var stopMarkerURL: URL { appSupportDir.appendingPathComponent("tun.stop") }
     static var kernelLogURL: URL { appSupportDir.appendingPathComponent("logs/tun-kernel.log") }
+    /// 「清空日志」的清理标记：GUI 投递，root 内核轮询到后自行截断直写的日志
+    /// （root 所属文件 GUI 截不动，运行中也不该硬删让 fd 变孤儿）。
+    static var clearLogMarkerURL: URL { appSupportDir.appendingPathComponent("tun.clearlog") }
     private static let sudoersFile = "/private/etc/sudoers.d/echos-tun"
 
     /// sudoers 规则：只写脚本路径，不带参数、不带 /bin/sh 前缀。sudoers 里命令
@@ -105,7 +108,8 @@ enum TunLauncher {
 
         // 内核经 perl setsid 脱离 sudo/GUI 的会话与进程组后再 exec：启动器、sudo
         // 退出后发往原进程组的信号波及不到内核；exec 不换 PID，`$!` 即内核 PID。
-        let command = ([executable] + arguments).map(shellQuote).joined(separator: " ")
+        // -tun-log：把日志路径传给内核，「清空日志」的截断标记靠它定位文件。
+        let command = ([executable] + arguments + ["-tun-log", kernelLogURL.path]).map(shellQuote).joined(separator: " ")
         let pidPath = appSupportDir.appendingPathComponent("kernel.pid").path
         let runScript = "#!/bin/sh\n"
             + "/usr/bin/perl -e 'use POSIX qw(setsid); setsid(); exec @ARGV or die \"exec: $!\"' -- "

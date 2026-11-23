@@ -1,7 +1,7 @@
 # Build output
 build/
 
-# 本地打包的成品 DMG（根目录，make-dmg.sh 输出；仓库用 GitHub Actions 发版）
+# 兼容旧版本：历史上成品 DMG 放根目录，现统一在 build/（已被上一节忽略）
 EchOS-mac-*.dmg
 
 # 内核编译产物（build.sh 只在 build/ 里产出；直接 go build 会落在 core/）
@@ -38,3 +38,6 @@ Mac客户端授权适配-进度表.md
 # 入库等于把源码再提交一份；且含会话 ID，绝不能公开）
 .mimosa/
 */.mimosa/
+
+# 授权服务端整套目录永不入库（含完整业务与攻防面；只允许本地/Windows 副本维护）
+license-server/

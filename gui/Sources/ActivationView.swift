@@ -1,16 +1,19 @@
 // 激活窗口：未激活 / 被吊销 / 校验过期时挡住主界面，让用户在这里把授权走完。
 //
-// 布局与交互逐块还原 Win 端 activation_page.dart：
-//   外层「客户端授权」大卡（错误分类时红色基调：感叹号盾 + 红边框）
-//   ├─ 卡片一「💭 注册激活步骤」：四步说明（蓝色序号圆）+ 设备码卡片（复制）
-//   │   + 激活码卡片（粘贴）+ 结果提示行 + [点我去 TG 群] [激活]
-//   └─ 卡片二「状态与网络」：动作独占的状态显示区（永远一行）+ [检查网络] [重新校验]
+// 2026-11-23 视觉重构（保持交互口径不变）：
+//   去掉整圈粗红框 + 30fps 流光，改为「顶部渐变高光条 + 状态胶囊」。
+//   外层「客户端授权」大卡（GeometryReader 撑满窗口，段间弹性均分）
+//   ├─ 头部：图标底板 + 标题 + 状态胶囊（错误态红色落在这里）
+//   ├─ 💭 注册激活步骤：四步（序号圆与凭证标签同为淡蓝底蓝字）
+//   ├─ 卡片一 凭证区：设备码 / 激活码各一行，标签块+码值块+按钮块三段带底色
+//   └─ 卡片二 操作区：一行共享信息 + 四个带彩色符号按钮（点我去TG群 / 点击激活
+//      / 检查网络 / 重新校验）
+//   所有信息文案只占单行；4 步说明与信息行均 lineLimit(1)。
 //
-// 与 Win 同款的交互口径：
+// 与 Win 同款的交互口径（本次一律不改）：
 //   · 复制成功 → 按钮变绿「已复制」，2 秒还原；
 //   · 激活按钮只有两态：蓝「激活」（失败后保持可重试，失败原因由提示行
-//     报告——按钮变成「激活失败」的话，提示行「点『激活』提交」指的按钮
-//     就不在页面上了）/ 绿「已激活」；改动输入立即复原；
+//     报告）/ 绿「已激活」；改动输入立即复原；
 //   · 「检查网络」是纯网络探测（真实 HTTPS 请求 + 延迟），**不触发授权
 //     校验**；「重新校验」才是授权动作。状态区动作独占：点哪个按钮，
 //     整个区就只显示那个按钮的结果，上一个动作的结论不残留；
@@ -99,78 +102,78 @@ struct ActivationView: View {
     @State private var netResult: (ok: Bool, ms: Int, detail: String)?
     /// 「检查网络」最近一次点击时刻（2 秒冷却：纯本机探测，连点没有意义）。
     @State private var lastNetCheckAt: Date?
+    /// 统一信息行显示谁的结果："act"=激活/粘贴/跳转 / "auth"=校验 / "net"=网络。
+    /// 四个按钮共用一行信息，靠它决定这行归哪个动作（动作独占，不残留）。
+    @State private var infoSource = "auth"
 
     // 主题色（与 Win EchTheme 同源）
     private var accentBlue: Color { Color(red: 10 / 255, green: 132 / 255, blue: 255 / 255) }
     private var accentGreen: Color { Color(red: 48 / 255, green: 209 / 255, blue: 88 / 255) }
     private var accentRed: Color { Color(red: 255 / 255, green: 59 / 255, blue: 48 / 255) }
-    private var sectionFill: Color {
-        colorScheme == .dark ? Color.white.opacity(0.09) : accentBlue.opacity(0.08)
+
+    private var cardFill: Color { colorScheme == .dark ? Color.white.opacity(0.035) : Color.white }
+    private var cardStroke: Color {
+        colorScheme == .dark ? Color.white.opacity(0.10) : Color.primary.opacity(0.08)
     }
-    private var sectionStroke: Color {
-        colorScheme == .dark ? Color.white.opacity(0.14) : accentBlue.opacity(0.16)
+    private var innerFill: Color {
+        colorScheme == .dark ? Color.white.opacity(0.055) : Color.primary.opacity(0.035)
     }
-    private var cardFill: Color { colorScheme == .dark ? Color.white.opacity(0.06) : Color.white.opacity(0.55) }
-    private var cardStroke: Color { colorScheme == .dark ? Color.white.opacity(0.12) : Color.primary.opacity(0.1) }
+    private var innerStroke: Color {
+        colorScheme == .dark ? Color.white.opacity(0.08) : Color.primary.opacity(0.07)
+    }
 
     var body: some View {
-        // 页面内容与高度固定，**不允许出现滚动**：纯静态布局，外层大卡在
-        // 窗口内垂直居中。
-        VStack(spacing: 0) {
-            Spacer(minLength: 0)
+        // 按窗口实际可用空间布局：GeometryReader 把父视图的确切尺寸传进来，
+        // 外层卡片在宽/高两个方向都撑满可用区（不再用固定自然高度 + 顶部对齐，
+        // 那会在窗口拉大时留一大片空白、窗口变窄时溢出）。卡片内部用带最小
+        // 间距的弹性 Spacer 分配富余：空间多时各段均匀拉开，空间不足时塌到
+        // 最小间距保持紧凑，始终贴合窗口比例。
+        GeometryReader { geo in
             outerCard
-                .frame(maxWidth: 560)
-            Spacer(minLength: 0)
+                .padding(20)
+                .frame(width: geo.size.width, height: geo.size.height, alignment: .top)
         }
-        .padding(24)
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color(nsColor: .windowBackgroundColor))
-        .onAppear {
-            codeInput = license.savedCode
-            authHeadline = headline(license.stage)
-            authToneRed = isBadStage(license.stage)
-            actErr = false
-            authErr = false
-            // 本地缓存先顶上：进页面即可见按钮，不等一趟网络
-            inviteLink = license.cachedInviteLink
-            Task { await loadInviteLink() }
-        }
-        .onReceive(license.$stage.removeDuplicates()) { _ in
-            alignSnapshotAfterRecovery()
-        }
-        .onReceive(license.resyncSubject) { _ in
-            // 「断网→恢复」的跳变：stage 可能没变（吊销/封禁被保留），
-            // 靠这条独立通知把状态行那快照对齐回真实档位。
-            alignSnapshotAfterRecovery()
-        }
+            .onAppear {
+                codeInput = license.savedCode
+                authHeadline = headline(license.stage)
+                authToneRed = isBadStage(license.stage)
+                actErr = false
+                authErr = false
+                // 本地缓存先顶上：进页面即可见按钮，不等一趟网络
+                inviteLink = license.cachedInviteLink
+                Task { await loadInviteLink() }
+            }
+            .onReceive(license.$stage.removeDuplicates()) { _ in
+                alignSnapshotAfterRecovery()
+            }
+            .onReceive(license.resyncSubject) { _ in
+                // 「断网→恢复」的跳变：stage 可能没变（吊销/封禁被保留），
+                // 靠这条独立通知把状态行那快照对齐回真实档位。
+                alignSnapshotAfterRecovery()
+            }
     }
 
     /// 断网期间状态行挂着「连接失败」，网络其实已恢复时把它对齐回真实档位。
     private func alignSnapshotAfterRecovery() {
-        // 状态行还挂着「连接失败」而网络其实已恢复（快速重试链拿到了新
-        // 结论，但硬拦档位没变、没有 stage 变化事件）——事件到来时把快照
-        // 对齐回真实档位，不让断网时的那句话一直盖着真实结论。
         if authHeadline.hasPrefix("授权服务器连接失败") && !license.netDown {
             authHeadline = headline(license.stage)
             authToneRed = isBadStage(license.stage)
         }
-        // 页面打开时断网、邀请链接还是空的：网络恢复的事件到来时补取一次
         if !license.netDown && inviteLink.isEmpty {
             Task { await loadInviteLink() }
         }
     }
 
     /// 「点我去 TG 群」链接：进页面先亮缓存，再向服务端取最新覆盖。
-    /// 取不到不重试循环——network 恢复会通过 stage 事件触发补取；断网时按钮
-    /// 照常显示（入口不因网络消失，没网时恰恰最需要它）。
     private func loadInviteLink() async {
         let link = await license.fetchInviteLink()
         if !link.isEmpty { inviteLink = link }
     }
 
-    // MARK: 外层大卡
+    // MARK: - 状态判定
 
-    /// 外层大卡的错误基调（感叹号 logo + 红边框 = Win 的 errored）：
+    /// 外层大卡的错误基调（顶部高光条 + 头部胶囊）：
     /// 激活/粘贴失败、重新校验得到否定结论，或当前就停在错误档位。
     /// 「检查网络」失败**不**参与——它只是探测，不是授权结论；把它算进来
     /// 会出现「网络红框但授权有效」的自相矛盾。
@@ -179,316 +182,434 @@ struct ActivationView: View {
     }
 
     /// 真正的「被拦下」档位（Win _stageBad）：码已签发是流程中段不是故障，
-    /// 所以不在此列——头部和边框保持蓝色。
+    /// 所以不在此列——头部胶囊保持蓝色。
     private func isBadStage(_ s: LicenseStage) -> Bool {
         switch s {
-        case .unregistered, .revoked, .banned, .unreachable: return true
+        // notConfigured 也按错误态红：用户口径——这台机器没走到激活，
+        // 就是「还没授权」，不该显示成蓝色的正常态。
+        case .unregistered, .revoked, .banned, .unreachable, .notConfigured: return true
         default: return false
         }
     }
 
+    private var beamColor: Color { errored ? accentRed : accentBlue }
+
+    // MARK: - 外层大卡
+
     private var outerCard: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            // 头部：图标 + 标题（无关闭按钮——激活页唯一出路是激活成功）
-            HStack(spacing: 8) {
-                Image(systemName: errored ? "exclamationmark.shield" : "checkmark.shield")
-                    .font(.system(size: 17))
-                    .foregroundColor(errored ? accentRed : accentBlue)
-                Text("客户端授权")
-                    .font(.system(size: 16, weight: .semibold))
-                Spacer()
-            }
+        VStack(alignment: .leading, spacing: 0) {
+            // 顶部渐变高光条：替代原来的整圈粗红框 + 流光。错误态红色、正常
+            // 态蓝色，一条 2.5pt 的柔和高光足够定调，不抢内容焦点。
+            topHighlight
 
-            sectionCard { registerSection }
-            sectionCard { statusSection }
+            VStack(alignment: .leading, spacing: 0) {
+                header
+
+                // 富余空间在 4 个间隙弹性均分。关键：卡片一↔卡片二 与
+                // 卡片二↔底部用同一种 sectionGap，两处距离永远一致（用户口径）。
+                // frame 有确切高度（GeometryReader），spacer 不会把内容顶出窗口。
+                sectionGap
+
+                VStack(alignment: .leading, spacing: 18) {
+                    stepTitle
+                    stepsSection
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 15)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(RoundedRectangle(cornerRadius: 12).fill(innerFill))
+                .overlay(RoundedRectangle(cornerRadius: 12).stroke(innerStroke, lineWidth: 1))
+
+                sectionGap
+
+                credentialSection
+
+                sectionGap
+
+                // 四个按钮 + 一行共享信息：一个整体卡片，不再有上下两处重合
+                // 提示行，也不需要额外横线分隔。
+                actionPanel
+
+                // 底部同样留一个 gap，与卡片一↔卡片二的间距对称
+                sectionGap
+            }
+            .padding(EdgeInsets(top: 20, leading: 22, bottom: 0, trailing: 22))
         }
-        .padding(EdgeInsets(top: 20, leading: 18, bottom: 14, trailing: 18))
-        .background(
-            RoundedRectangle(cornerRadius: 14)
-                .fill(colorScheme == .dark ? Color.white.opacity(0.05) : Color.white.opacity(0.8)))
-        .overlay(RoundedRectangle(cornerRadius: 14)
-            .stroke(errored ? accentRed.opacity(0.4) : accentBlue.opacity(0.3), lineWidth: 1))
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .background(RoundedRectangle(cornerRadius: 18).fill(cardFill))
+        .overlay(
+            RoundedRectangle(cornerRadius: 18)
+                .stroke(errored
+                        ? accentRed.opacity(colorScheme == .dark ? 0.32 : 0.28)
+                        : cardStroke,
+                        lineWidth: 1)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 18))
     }
 
-    /// 内层分区卡（Win _sectionCard）：磨砂质感的蓝色淡染
-    private func sectionCard<Content: View>(@ViewBuilder content: () -> Content) -> some View {
-        VStack(alignment: .leading, spacing: 0, content: content)
-            .padding(EdgeInsets(top: 16, leading: 12, bottom: 16, trailing: 12))
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(RoundedRectangle(cornerRadius: 12).fill(sectionFill))
-            .overlay(RoundedRectangle(cornerRadius: 12).stroke(sectionStroke, lineWidth: 1))
-            .padding(.horizontal, 2)
+    /// 段间弹性间距：空间富余时均分拉开，窗口小时塌到最小间距。
+    private var sectionGap: some View {
+        Spacer(minLength: 14)
     }
 
-    // MARK: 卡片一：注册激活步骤
+    private var stepTitle: some View {
+        Text("💭 注册激活步骤")
+            .font(.system(size: 18, weight: .semibold))
+    }
 
-    private var registerSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("💭 注册激活步骤")
-                .font(.system(size: 15, weight: .semibold))
+    private var topHighlight: some View {
+        LinearGradient(
+            colors: [beamColor.opacity(0), beamColor.opacity(0.85), beamColor.opacity(0)],
+            startPoint: .leading,
+            endPoint: .trailing
+        )
+        .frame(height: 2.5)
+    }
 
-            stepLine(1, "复制本机<设备码>", "一机一码，注意保护个人隐私。")
-            stepLine(2, "跳转 TG 授权群注册本机获取激活码",
-                     "暂时仅签发TG用户，签发后状态会变成「激活码已签发」。")
-            stepLine(3, "将<激活码>粘贴到「激活码」卡片，点击「激活」",
-                     "激活码形如 ECHS-XXXX-XXXX-XXXX-XXXX，请妥善保管。")
-            helpLine
+    // MARK: - 头部
 
-            deviceCard
-            if license.stage != .notConfigured {
-                codeCard
-                // 结果提示行：报告「刚才那次激活/粘贴怎么了」，离触发按钮最近
-                if !tip.isEmpty {
-                    Text(tip)
-                        .font(.system(size: 11, weight: tipColor == .secondary ? .regular : .medium))
-                        .foregroundColor(tipColor)
-                        .lineLimit(3)
-                        .padding(.top, 2)
-                }
-                actionButtons
-            } else if !inviteLink.isEmpty {
-                GradientButton(title: "点我去 TG 群", enabled: !busy) {
-                    openInvite()
-                }
-                if !tip.isEmpty {
-                    Text(tip)
-                        .font(.system(size: 11, weight: tipColor == .secondary ? .regular : .medium))
-                        .foregroundColor(tipColor)
-                        .lineLimit(3)
-                        .padding(.top, 2)
-                }
+    private var header: some View {
+        HStack(alignment: .center, spacing: 13) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 12)
+                    .fill(LinearGradient(colors: [beamColor.opacity(0.95), beamColor.opacity(0.6)],
+                                         startPoint: .topLeading, endPoint: .bottomTrailing))
+                Image(systemName: errored ? "exclamationmark.shield.fill" : "checkmark.shield.fill")
+                    .font(.system(size: 22, weight: .medium))
+                    .foregroundColor(.white)
             }
+            .frame(width: 44, height: 44)
+            .shadow(color: beamColor.opacity(0.22), radius: 8, y: 2)
+
+            Text("客户端授权")
+                .font(.system(size: 20, weight: .semibold))
+
+            Spacer(minLength: 8)
+
+            Text(statusBadgeText)
+                .font(.system(size: 11.5, weight: .semibold))
+                .foregroundColor(statusBadgeColor)
+                .padding(.horizontal, 11)
+                .padding(.vertical, 5)
+                .background(
+                    Capsule().fill(statusBadgeColor.opacity(colorScheme == .dark ? 0.16 : 0.11))
+                )
+        }
+    }
+
+    private var statusBadgeText: String {
+        switch license.stage {
+        case .active, .unreachable: return "授权有效"
+        case .notConfigured: return "未配置授权"
+        case .enforcementOff: return "校验停用"
+        case .unregistered, .codeIssued: return "尚未激活"
+        case .revoked: return "已吊销"
+        case .banned: return "已封禁"
+        case .unknown: return "校验中"
+        }
+    }
+
+    private var statusBadgeColor: Color {
+        switch license.stage {
+        case .active: return accentGreen
+        // 未配置 / 未授权 / 被拦，一律红色基调
+        case .unreachable, .revoked, .banned, .unregistered, .notConfigured: return accentRed
+        case .codeIssued: return accentBlue
+        default: return .secondary
+        }
+    }
+
+    // MARK: - 注册激活步骤（三步时间线）
+
+    private var stepsSection: some View {
+        VStack(alignment: .leading, spacing: 26) {
+            stepLine(1, "复制本机设备码", "一机一码，请妥善保管。")
+            stepLine(2, "前往 TG 群注册本机，获取激活码",
+                     "目前仅向 TG 用户签发，签发后状态变为「激活码已签发」。")
+            stepLine(3, "粘贴激活码，点击激活按钮完成注册",
+                     "激活码形如 ECHS-XXXX-XXXX-XXXX-XXXX。")
+            helpStep
         }
     }
 
     private func stepLine(_ n: Int, _ title: String, _ detail: String) -> some View {
-        HStack(alignment: .top, spacing: 10) {
+        HStack(alignment: .top, spacing: 12) {
             Text("\(n)")
-                .font(.system(size: 11, weight: .semibold))
+                .font(.system(size: 13, weight: .bold))
                 .foregroundColor(accentBlue)
-                .frame(width: 18, height: 18)
-                .background(Circle().fill(accentBlue.opacity(0.14)))
-            VStack(alignment: .leading, spacing: 2) {
+                .frame(width: 24, height: 24)
+                .background(Circle().fill(accentBlue.opacity(colorScheme == .dark ? 0.18 : 0.12)))
+            VStack(alignment: .leading, spacing: 5) {
                 Text(title)
-                    .font(.system(size: 12.5, weight: .medium))
+                    .font(.system(size: 14, weight: .medium))
+                    .lineLimit(1)
                 Text(detail)
-                    .font(.system(size: 11))
+                    .font(.system(size: 12))
                     .foregroundColor(.secondary)
+                    .lineLimit(1)
             }
             Spacer(minLength: 0)
         }
-        .padding(.bottom, 4)
     }
 
-    /// 第 ④ 步：帮助与反馈（含仓库 Star 链接）
-    private var helpLine: some View {
-        HStack(alignment: .top, spacing: 10) {
-            Text("4")
-                .font(.system(size: 11, weight: .semibold))
+    // MARK: - 凭证卡：设备码 / 激活码（一个卡片上下两行，标题加粗加大）
+
+    private var credentialSection: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            fieldRow(label: "设备码") {
+                Text(license.deviceCode)
+                    .font(.system(size: 14, design: .monospaced))
+                    .textSelection(.enabled)
+                    .lineLimit(1)
+            } action: {
+                GradientButton(title: copied ? "已复制" : "复制",
+                               gradient: copied
+                                   ? LinearGradient(colors: [accentGreen, accentGreen.opacity(0.85)],
+                                                    startPoint: .leading, endPoint: .trailing)
+                                   : nil,
+                               filledWidth: 64, height: 34,
+                               enabled: !busy) {
+                    copyDeviceCode()
+                }
+            }
+
+            if license.stage != .notConfigured {
+                Divider()
+
+                fieldRow(label: "激活码") {
+                    TextField("ECHS-XXXX-XXXX-XXXX-XXXX", text: $codeInput)
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 14, design: .monospaced))
+                        // 填入的码默认跟主题文字色，激活成功变蓝（Win _codeCard 同款；
+                        // 失败不变色——失败由提示行报告）
+                        .foregroundColor(activateResult == "ok" ? accentBlue : .primary)
+                        .disabled(busy)
+                        .onChange(of: codeInput) { _ in
+                            // 改了码，上一次的激活结果就作废：按钮回到「激活」
+                            if activateResult != nil { activateResult = nil }
+                        }
+                } action: {
+                    GradientButton(title: "粘贴", filledWidth: 64, height: 34, enabled: !busy) {
+                        pasteCode()
+                    }
+                }
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 15)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 12).fill(innerFill))
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(innerStroke, lineWidth: 1))
+    }
+
+    /// 卡内一行：标签块 + 码值块 + 动作块，三段各自带底色，横向排成一行。
+    /// 标签用蓝色淡底胶囊，码值用更深的输入底，动作交给按钮自己的背景。
+    private func fieldRow<Content: View, Action: View>(label: String,
+                                                       @ViewBuilder content: () -> Content,
+                                                       @ViewBuilder action: () -> Action) -> some View {
+        HStack(spacing: 10) {
+            Text(label)
+                .font(.system(size: 13, weight: .semibold))
                 .foregroundColor(accentBlue)
-                .frame(width: 18, height: 18)
-                .background(Circle().fill(accentBlue.opacity(0.14)))
-            VStack(alignment: .leading, spacing: 2) {
+                .padding(.horizontal, 13)
+                .frame(height: 34, alignment: .center)
+                .background(
+                    RoundedRectangle(cornerRadius: 9)
+                        .fill(accentBlue.opacity(colorScheme == .dark ? 0.16 : 0.10))
+                )
+
+            content()
+                .padding(.horizontal, 12)
+                .frame(maxWidth: .infinity, minHeight: 34, alignment: .leading)
+                .background(
+                    RoundedRectangle(cornerRadius: 9)
+                        .fill(colorScheme == .dark ? Color.white.opacity(0.06) : Color.primary.opacity(0.045))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 9)
+                        .stroke(colorScheme == .dark ? Color.white.opacity(0.07) : Color.primary.opacity(0.06),
+                                lineWidth: 1)
+                )
+
+            action()
+        }
+    }
+
+    // MARK: - 操作面板：四个按钮 + 一行共享信息
+
+    private var actionPanel: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            // 唯一的信息行：由 infoSource 决定显示哪个动作的结果，动作独占、
+            // 不残留——彻底解决原版「上方 tip 行 + 下方状态行」两处信息重合。
+            infoLineView
+
+            // 四个按钮 2×2：主操作「激活 / 点我去 TG 群」在上，
+            // 诊断操作「检查网络 / 重新校验」在下。
+            VStack(spacing: 10) {
+                HStack(spacing: 10) {
+                    if !inviteLink.isEmpty {
+                        GradientButton(title: "点我去 TG 群", height: 40, enabled: !busy,
+                                       tint: accentBlue, symbol: "paperplane.fill", symbolColor: accentBlue) {
+                            openInvite()
+                        }
+                    }
+                    // 空码也保持可点：点了由信息行报「请输入激活码」。
+                    // 按钮只有两态：蓝「点击激活」（默认与失败后）/ 绿「已激活」；改动输入立即复原。
+                    GradientButton(title: activateResult == "ok" ? "已激活" : "点击激活",
+                                   gradient: activateResult == "ok"
+                                       ? LinearGradient(colors: [accentGreen, accentGreen.opacity(0.85)],
+                                                        startPoint: .leading, endPoint: .trailing)
+                                       : LinearGradient(colors: [accentBlue, accentBlue.opacity(0.85)],
+                                                        startPoint: .leading, endPoint: .trailing),
+                                   height: 40,
+                                   enabled: !busy,
+                                   symbol: "key.fill", symbolColor: .white) {
+                        Task { await activate() }
+                    }
+                }
+                HStack(spacing: 10) {
+                    // 「检查网络」只在「授权不可达且本次还没测通」时红色强调——
+                    // 测通了网络就被证明没问题，红着只会自相矛盾。
+                    let netFailing = (netResult == nil && license.stage == .unreachable)
+                        || netResult?.ok == false
+                    GradientButton(title: "检查网络",
+                                   gradient: netFailing
+                                       ? LinearGradient(colors: [accentRed, accentRed.opacity(0.85)],
+                                                        startPoint: .leading, endPoint: .trailing)
+                                       : nil,
+                                   height: 40,
+                                   enabled: !busy,
+                                   tint: netFailing ? nil : accentGreen,
+                                   symbol: "wifi", symbolColor: netFailing ? .white : accentGreen) {
+                        Task { await checkNetwork() }
+                    }
+                    GradientButton(title: "重新校验", height: 40, enabled: !busy,
+                                   tint: accentBlue, symbol: "arrow.triangle.2.circlepath",
+                                   symbolColor: accentBlue) {
+                        Task { await reverify() }
+                    }
+                }
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 15)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 12).fill(innerFill))
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(innerStroke, lineWidth: 1))
+    }
+
+    /// 共享的信息行视图：永远显示一行——进行中转圈，结束按结论着色。
+    /// 自带淡色底 + 上下留白，作为卡片二里的信息条，不再贴着按钮。
+    private var infoLineView: some View {
+        HStack(spacing: 9) {
+            if infoLine.busy {
+                ProgressView()
+                    .scaleEffect(0.75)
+                    .frame(width: 16, height: 16)
+            } else {
+                Image(systemName: infoLine.icon)
+                    .font(.system(size: 14, weight: .semibold))
+            }
+            Text(infoLine.text)
+                .font(.system(size: 13, weight: infoLine.busy ? .regular : .medium))
+                .foregroundColor(infoLine.tone)
+                .lineLimit(1)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 13)
+        .padding(.vertical, 11)
+        .background(
+            RoundedRectangle(cornerRadius: 9)
+                .fill(infoLine.tone.opacity(colorScheme == .dark ? 0.11 : 0.07))
+        )
+    }
+
+    /// 唯一信息行的文案来源。动作独占口径与原实现一致：
+    ///   · "act"   —— 激活/粘贴/跳转的结果（tip，成功蓝 / 失败红 / 默认灰）
+    ///   · "net"   —— 检查网络结论（真实 HTTPS 探测，不是授权结论）
+    ///   · "auth"  —— 重新校验/启动校验的授权结论快照（不被后台复查冲掉）
+    private var infoLine: (icon: String, text: String, tone: Color, busy: Bool) {
+        switch infoSource {
+        case "act":
+            if activateResult == "ok" {
+                return ("checkmark.circle.fill", tip.isEmpty ? "已激活。" : tip, accentBlue, false)
+            }
+            if actErr {
+                return ("exclamationmark.circle.fill", tip.isEmpty ? "操作失败。" : tip, accentRed, false)
+            }
+            if !tip.isEmpty {
+                return ("info.circle", tip, .secondary, false)
+            }
+            return ("info.circle", "请粘贴激活码，点击激活按钮提交。", .secondary, false)
+
+        case "net":
+            if busy && netResult == nil {
+                return ("hourglass", busyLabel, .secondary, true)
+            } else if let net = netResult {
+                let text = (net.ok ? "授权服务器连接成功" : "授权服务器连接失败")
+                    + " · " + net.detail
+                return (net.ok ? "checkmark.circle.fill" : "xmark.circle.fill",
+                        text, net.ok ? accentGreen : accentRed, false)
+            }
+
+        default: // "auth"
+            if busy {
+                return ("hourglass", busyLabel, .secondary, true)
+            }
+            return (authToneRed ? "exclamationmark.triangle.fill" : "checkmark.shield.fill",
+                    authHeadline,
+                    authToneRed ? accentRed : Color.secondary.opacity(0.85),
+                    false)
+        }
+        // "net" 动作完成但结果丢失（本地开发包早退）的兜底
+        return ("hourglass", busyLabel, .secondary, true)
+    }
+
+    /// 进行时文案与触发它的按钮语义对齐。
+    private var busyLabel: String {
+        busyAction == "net" ? "正在检查网络…" : (busyAction == "activate" ? "正在校验激活码…" : "正在校验授权…")
+    }
+
+    /// 第 4 步：帮助与反馈（与前三步同一形态；Star 是主链接，给足视觉重量）
+    private var helpStep: some View {
+        HStack(alignment: .top, spacing: 12) {
+            Text("4")
+                .font(.system(size: 13, weight: .bold))
+                .foregroundColor(accentBlue)
+                .frame(width: 24, height: 24)
+                .background(Circle().fill(accentBlue.opacity(colorScheme == .dark ? 0.18 : 0.12)))
+            VStack(alignment: .leading, spacing: 3) {
                 Text("帮助与反馈")
-                    .font(.system(size: 12.5, weight: .medium))
-                Text("公益项目，避免传播与滥用设置了注册激活机制，如有问题请提交issue。")
-                    .font(.system(size: 11))
+                    .font(.system(size: 14, weight: .medium))
+                Text("公益项目，为防止滥用设有注册激活机制，如有问题请提交 issue。")
+                    .font(.system(size: 12))
                     .foregroundColor(.secondary)
+                    .lineLimit(1)
                 HStack(spacing: 2) {
                     Text("开源不易，帮忙")
-                        .font(.system(size: 11))
+                        .font(.system(size: 12))
                         .foregroundColor(.secondary)
                     Button {
                         if let url = URL(string: "https://github.com/nerder-real/EchOS") {
                             NSWorkspace.shared.open(url)
                         }
                     } label: {
-                        Text("点个Star⭐")
-                            .font(.system(size: 11))
+                        Text("点个 Star ⭐")
+                            .font(.system(size: 12, weight: .semibold))
                             .foregroundColor(accentBlue)
                             .underline()
                     }
                     .buttonStyle(.plain)
                     Text("吧~")
-                        .font(.system(size: 11))
+                        .font(.system(size: 12))
                         .foregroundColor(.secondary)
                 }
             }
             Spacer(minLength: 0)
         }
-        .padding(.bottom, 4)
     }
 
-    // MARK: 设备码卡片 / 激活码卡片（同一个壳：小标签 + 内容 + 右侧动作按钮）
-
-    private var deviceCard: some View {
-        fieldCard(label: "设备码") {
-            Text(license.deviceCode)
-                .font(.system(size: 15, design: .monospaced))
-                .textSelection(.enabled)
-                .lineLimit(1)
-                .minimumScaleFactor(0.5)
-                // 撑满整行：复制按钮落到行尾右对齐，与「粘贴」按钮同一布局，
-                // 不挨着编码挤在中间
-                .frame(maxWidth: .infinity, alignment: .leading)
-        } action: {
-            GradientButton(title: copied ? "已复制" : "复制",
-                           gradient: copied
-                               ? LinearGradient(colors: [accentGreen, accentGreen.opacity(0.85)],
-                                                startPoint: .leading, endPoint: .trailing)
-                               : nil,
-                           filledWidth: 64,
-                           enabled: !busy) {
-                copyDeviceCode()
-            }
-        }
-    }
-
-    private var codeCard: some View {
-        fieldCard(label: "激活码") {
-            TextField("ECHS-XXXX-XXXX-XXXX-XXXX", text: $codeInput)
-                .textFieldStyle(.plain)
-                .font(.system(size: 15, design: .monospaced))
-                // 填入的码默认跟主题文字色，激活成功变蓝（Win _codeCard 同款；
-                // 失败不变色——失败由提示行报告）
-                .foregroundColor(activateResult == "ok" ? accentBlue : .primary)
-                .disabled(busy)
-                .onChange(of: codeInput) { _ in
-                    // 改了码，上一次的激活结果就作废：按钮回到「激活」
-                    if activateResult != nil { activateResult = nil }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-        } action: {
-            GradientButton(title: "粘贴", filledWidth: 64, enabled: !busy) {
-                pasteCode()
-            }
-        }
-    }
-
-    /// 卡片壳（Win _card）：小标签 + 内容 + 右侧动作按钮
-    private func fieldCard<Content: View, Action: View>(label: String,
-                                                        @ViewBuilder content: () -> Content,
-                                                        @ViewBuilder action: () -> Action) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text(label)
-                .font(.system(size: 11))
-                .foregroundColor(.secondary)
-            HStack(spacing: 10) {
-                content()
-                action()
-            }
-        }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 12)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(RoundedRectangle(cornerRadius: 12).fill(cardFill))
-        .overlay(RoundedRectangle(cornerRadius: 12).stroke(cardStroke, lineWidth: 1))
-    }
-
-    /// 按钮行（Win 同款：两个独立按钮并排，跳转在前、主动作在后）。
-    /// 「点我去 TG 群」描边样式（非主动作无背景高亮），链接取到即显示；
-    /// DNS 污染修复后首次加载即可达，不再出现延迟弹出的布局跳动。
-    private var actionButtons: some View {
-        HStack(spacing: 10) {
-            if !inviteLink.isEmpty {
-                GradientButton(title: "点我去 TG 群", enabled: !busy) {
-                    openInvite()
-                }
-            }
-            // 空码也保持可点：点了由提示行报「请输入激活码」。
-            // 按钮只有两态：蓝「激活」（默认与失败后——失败原因由提示行
-            // 报告，按钮变红「激活失败」的话，提示行里「点『激活』提交」
-            // 指的那个按钮就不在页面上了）/ 绿「已激活」；改动输入立即复原。
-            GradientButton(title: activateResult == "ok" ? "已激活" : "激活",
-                           gradient: activateResult == "ok"
-                               ? LinearGradient(colors: [accentGreen, accentGreen.opacity(0.85)],
-                                                startPoint: .leading, endPoint: .trailing)
-                               : LinearGradient(colors: [accentBlue, accentBlue.opacity(0.85)],
-                                                startPoint: .leading, endPoint: .trailing),
-                           enabled: !busy) {
-                Task { await activate() }
-            }
-        }
-        .padding(.top, 4)
-    }
-
-    /// 提示行跟随结果分类：成功蓝（与激活按钮同一套指示）、失败红、默认灰
-    private var tipColor: Color {
-        if activateResult == "ok" { return accentBlue }
-        if actErr { return accentRed }
-        return .secondary
-    }
-
-    // MARK: 卡片二：状态与网络
-
-    private var statusSection: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            // 状态显示区（动作独占）：**永远显示一行信息**——进行中显示
-            // 执行内容，结束显示结论。文字按结论分类着色，没有任何状态允许空行。
-            if actionLine == "net" {
-                if busy && netResult == nil {
-                    Text(busyLabel)
-                        .font(.system(size: 12.5))
-                        .foregroundColor(.secondary)
-                } else if let net = netResult {
-                    HStack(spacing: 6) {
-                        Image(systemName: net.ok ? "checkmark.circle.fill" : "xmark.circle.fill")
-                            .font(.system(size: 13))
-                            .foregroundColor(net.ok ? accentGreen : accentRed)
-                        Text(net.ok ? "授权服务器连接成功" : "授权服务器连接失败")
-                            .font(.system(size: 11.5, weight: .medium))
-                            .foregroundColor(net.ok ? accentBlue : accentRed)
-                        Text(net.detail)
-                            .font(.system(size: 11.5))
-                            .foregroundColor(Color.secondary.opacity(0.75))
-                            .lineLimit(1)
-                    }
-                } else {
-                    // 动作完成但结果丢失（本地开发包早退）：兜底显示执行内容
-                    Text(busyLabel)
-                        .font(.system(size: 12.5))
-                        .foregroundColor(.secondary)
-                }
-            } else {
-                // 读快照而不是实时 stage：「重新校验」的结论定格到下一次授权
-                // 动作，后台定时复查改变 stage 不会实时冲掉这一行（动作独占）。
-                // 进行时只属于授权/网络动作——点「激活」时这一行保持上一条结论，
-                // 「激活」的进行时由提示行自己承担，两边各说各的。
-                Text(statusBusy ? busyLabel : authHeadline)
-                    .font(.system(size: 12.5, weight: statusBusy ? .regular : .medium))
-                    .foregroundColor(statusBusy ? .secondary
-                                     : (authToneRed ? accentRed : Color.secondary.opacity(0.85)))
-            }
-
-            // 状态按钮行：常驻。「检查网络」只在「授权不可达且本次还没测通」
-            // 时红色强调——测通了网络就被证明没问题，红着只会自相矛盾。
-            HStack(spacing: 10) {
-                GradientButton(title: "检查网络",
-                               gradient: (netResult == nil
-                                          && license.stage == .unreachable)
-                                   || netResult?.ok == false
-                                   ? LinearGradient(colors: [accentRed, accentRed.opacity(0.85)],
-                                                    startPoint: .leading, endPoint: .trailing)
-                                   : nil,
-                               enabled: !busy) {
-                    Task { await checkNetwork() }
-                }
-                GradientButton(title: "重新校验", enabled: !busy) {
-                    Task { await reverify() }
-                }
-            }
-        }
-    }
-
-    /// 状态区的进行时只属于授权/网络动作：点「激活」时这一行不动。
-    private var statusBusy: Bool { busy && busyAction != "activate" }
-
-    /// 进行时文案与触发它的按钮语义对齐。
-    private var busyLabel: String {
-        busyAction == "net" ? "正在检查网络…" : "正在校验授权…"
-    }
-
-    // MARK: 动作
+    // MARK: - 动作
 
     private func copyDeviceCode() {
         let pb = NSPasteboard.general
@@ -504,6 +625,7 @@ struct ActivationView: View {
     /// 从剪贴板取激活码填进框里。不自动提交：粘进来的是不是本机的码只有
     /// 服务端知道，先让用户看一眼再决定要不要点「激活」。
     private func pasteCode() {
+        infoSource = "act"
         let text = (NSPasteboard.general.string(forType: .string) ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         if text.isEmpty {
@@ -512,21 +634,18 @@ struct ActivationView: View {
             return
         }
         codeInput = text
-        // 粘贴换了码，上一次的激活结果随之作废（与手动输入同一条规矩），
-        // 不然按钮和输入框还停在「已激活」的旧结果上。
         activateResult = nil
-        tip = "已粘贴，点「激活」提交"
+        tip = "已粘贴，点击激活按钮提交"
         actErr = false
     }
 
     private func openInvite() {
+        infoSource = "act"
         guard let url = URL(string: inviteLink) else {
             tip = "打开失败：链接无效"
             actErr = true
             return
         }
-        // 与 Win openExternalUrl 同口径：打不开要在提示行说一句，
-        // 不能让按钮点了毫无反应。
         if !NSWorkspace.shared.open(url) {
             tip = "打开失败：系统没有可处理该链接的应用"
             actErr = true
@@ -535,6 +654,7 @@ struct ActivationView: View {
 
     private func activate() async {
         guard !busy else { return }
+        infoSource = "act"
         busy = true
         busyAction = "activate"
         tip = "正在校验…"
@@ -543,19 +663,10 @@ struct ActivationView: View {
         let r = await license.activate(codeInput)
         busy = false
         busyAction = nil
-        // 激活失败也可能是因为连不上服务器：状态行已挂着那句「连接失败」
-        // （刚按过重新校验）提示行就不再复述同一句；状态行还在说旧结论时
-        // 由提示行自己报一次。失败原因归提示行（红色），按钮保持可重试。
         let statusShowsNetFail = authHeadline.hasPrefix("授权服务器连接失败")
         tip = (r.stage == .unreachable || (!r.ok && statusShowsNetFail)) ? "" : r.message
         actErr = !r.ok
-        // 按钮只有两态（Win 用户口径）：成功 → 绿「已激活」；失败 → 保持
-        // 蓝「激活」随时可重试——失败原因由提示行报告，若把按钮变成红色
-        // 「激活失败」，提示行里「点『激活』提交」指的那个按钮就不在页面上了
         activateResult = (r.ok && r.stage == .active) ? "ok" : nil
-        // 激活成功由根视图按 stage 自动切回主界面（对齐 Win：激活页没有
-        // 返回键，唯一出路是激活成功）。事件万一没送达，600ms 后重发一次：
-        // 对已切换的实例是无害的幂等通知，对卡在本页的实例是确定性的解药。
         if activateResult == "ok" {
             try? await Task.sleep(nanoseconds: 600_000_000)
             guard !Task.isCancelled else { return }
@@ -563,36 +674,32 @@ struct ActivationView: View {
         }
     }
 
-    /// 纯网络探测（**真实 HTTPS 请求**，替换早期的纯 TCP 握手）：TCP 能通
-    /// 只说明「有东西在 443 应答」——本机过滤/代理工具（如 AdGuard 的
-    /// HTTPS 过滤）会本地代答，出现「TCP 2ms 成功、TLS 实际被掐」的假象。
-    /// 这里走完整 TLS + HTTP，任何 HTTP 应答（含 4xx）都算通，失败带回
-    /// 错误原因。强制直连，不走系统代理。
+    /// 纯网络探测（真实 HTTPS 请求：TCP 能通不代表 TLS/HTTP 能通）：
+    /// 走完整 TLS + HTTP，任何 HTTP 应答（含 4xx）都算通，失败带回错误原因。
+    /// 强制直连，不走系统代理。
     private func checkNetwork() async {
         guard !busy else { return }
-        // 2 秒冷却：纯本机探测对服务端零负担，连点没有意义。冷却期内的
-        // 重复点击直接忽略，按钮也不进「正在检查」假态。
         let now = Date()
         if let last = lastNetCheckAt, now.timeIntervalSince(last) < 2 { return }
         lastNetCheckAt = now
+        infoSource = "net"
         busy = true
         busyAction = "net"
         netResult = nil
         actionLine = "net"
         let base = license.serverBaseURL
         guard !base.isEmpty else {
-            // 本地开发包（没注入授权地址）：界面不留提示，状态区归位回授权线
+            // 本地开发包（没注入授权地址）：界面不留提示，信息行归位回授权线
             busy = false
             busyAction = nil
             actionLine = nil
+            infoSource = "auth"
             return
         }
         let (ok, ms, detail) = await httpsProbe(base: base, timeout: 6)
         busy = false
         busyAction = nil
         netResult = (ok, ms, detail)
-        // 网络通了但邀请链接还空着：多半是打开页面那一次取链接抖动失败，
-        // 补取一次，别让按钮凭空消失
         if ok && inviteLink.isEmpty {
             Task { await loadInviteLink() }
         }
@@ -601,7 +708,7 @@ struct ActivationView: View {
     private func httpsProbe(base: String, timeout: TimeInterval) async -> (Bool, Int, String) {
         guard let url = URL(string: base) else { return (false, 0, "地址无效") }
         let cfg = URLSessionConfiguration.ephemeral
-        cfg.connectionProxyDictionary = [:]   // 直连，不走系统代理
+        cfg.connectionProxyDictionary = [:]
         cfg.timeoutIntervalForRequest = timeout
         let session = URLSession(configuration: cfg)
         var req = URLRequest(url: url)
@@ -622,22 +729,16 @@ struct ActivationView: View {
 
     private func reverify() async {
         guard !busy else { return }
+        infoSource = "auth"
         busy = true
         busyAction = "auth"
-        // 独占制：点重新校验，整个状态区就只属于授权校验，上一次检查网络的
-        // 结果一并清掉。
         netResult = nil
         actionLine = "auth"
-        // 用户按钮：击穿 TTL
         let r = await license.verify(force: true, source: "用户手动").value
         busy = false
         busyAction = nil
-        // 节流命中：这一按没有产生任何新信息，状态行维持原样——尤其不能
-        // 按旧档位结论刷新回去，那会和真实失败的「连接失败」来回翻面。
         if r.throttled { return }
         authErr = !r.ok
-        // 一按一条消息，且只占状态行一行（一行信息原则）：问出否定结论时
-        // 报「连接失败」那句（带具体网络原因），否则按档位说话。
         if !r.ok && r.stage != .unreachable {
             authHeadline = license.netFailHeadline
             authToneRed = true
@@ -647,20 +748,18 @@ struct ActivationView: View {
         }
     }
 
-    /// 状态行的授权结论。**每个状态都必须有非空文案**——状态区在结构上只有
-    /// 一行，留空就是一行空白（Win 用空格占位，Mac 直接给出能读的话）。
+    /// 状态行的授权结论。**每个状态都必须有非空文案**。
     private func headline(_ s: LicenseStage) -> String {
         switch s {
         case .unregistered:
             return "客户端暂「未授权」，请访问TG群获取激活码。"
         case .codeIssued:
-            return "激活码「已签发」，请将激活码粘贴到输入框后，点击「激活」完成注册。"
+            return "激活码已签发，请粘贴后点击激活按钮完成注册。"
         case .revoked:
             return "客户端授权「已吊销」，如有问题请联系管理员反馈。"
         case .banned:
             return "客户端授权「已被封禁」，如有问题请联系管理员反馈。"
         case .unreachable:
-            // 带具体网络原因（service 侧对最近一次失败的分类），一行说完
             return license.netFailHeadline
         case .unknown:
             return "正在校验授权…"
@@ -674,7 +773,7 @@ struct ActivationView: View {
     }
 }
 
-// MARK: - 渐变/描边胶囊按钮（Win AppButton 同款形态：40pt 高、半宽、主动作在右）
+// MARK: - 渐变/描边胶囊按钮（Win AppButton 同款形态：主按钮 42pt、小按钮 30/34pt）
 
 struct GradientButton: View {
     let title: String
@@ -683,26 +782,37 @@ struct GradientButton: View {
     var filledWidth: CGFloat?
     var height: CGFloat = 40
     var enabled = true
+    /// 描边按钮的着色（文字 + 边框 + 淡底），用于次主操作的分级
+    var tint: Color?
+    /// 按钮文字前的符号（SF Symbol 名），给每个按钮一个彩色标识
+    var symbol: String?
+    var symbolColor: Color?
     let action: () -> Void
 
     @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
         Button(action: action) {
-            Text(title)
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundColor(foreground)
-                .frame(width: filledWidth, height: height)
-                .frame(maxWidth: filledWidth == nil ? .infinity : nil)
-                .background(
-                    RoundedRectangle(cornerRadius: 10)
-                        .fill(gradient.map { AnyShapeStyle($0) }
-                              ?? AnyShapeStyle(colorScheme == .dark
-                                               ? Color.white.opacity(0.08)
-                                               : Color.white.opacity(0.6))))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 10)
-                        .stroke(borderColor, lineWidth: 1))
+            HStack(spacing: 7) {
+                if let symbol {
+                    Image(systemName: symbol)
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundColor(symbolColor ?? foreground)
+                }
+                Text(title)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(foreground)
+            }
+            .frame(width: filledWidth, height: height)
+            .frame(maxWidth: filledWidth == nil ? .infinity : nil)
+            .background(
+                RoundedRectangle(cornerRadius: 9)
+                    .fill(gradient.map { AnyShapeStyle($0) }
+                          ?? AnyShapeStyle(fillColor))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 9)
+                    .stroke(borderColor, lineWidth: tint != nil ? 1.2 : 1))
         }
         .buttonStyle(.plain)
         .disabled(!enabled)
@@ -710,10 +820,19 @@ struct GradientButton: View {
     }
 
     private var foreground: Color {
-        gradient != nil ? .white : .primary
+        if gradient != nil { return .white }
+        if let tint { return tint }
+        return .primary
+    }
+
+    private var fillColor: Color {
+        if let tint { return tint.opacity(colorScheme == .dark ? 0.14 : 0.08) }
+        return colorScheme == .dark ? Color.white.opacity(0.08) : Color.black.opacity(0.045)
     }
 
     private var borderColor: Color {
-        gradient != nil ? .clear : Color.primary.opacity(0.15)
+        if gradient != nil { return .clear }
+        if let tint { return tint.opacity(colorScheme == .dark ? 0.55 : 0.45) }
+        return Color.primary.opacity(0.12)
     }
 }

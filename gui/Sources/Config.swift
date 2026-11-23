@@ -15,7 +15,7 @@ enum LogLevel: String, Codable, CaseIterable, Identifiable {
         switch self {
         case .off:       return "关闭"
         case .error:     return "仅错误"
-        case .warning:   return "警告以上"
+        case .warning:   return "警告"
         case .info:      return "全部"
         case .checkOnly: return "自检记录"
         case .authOnly:  return "授权记录"

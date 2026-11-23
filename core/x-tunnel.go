@@ -308,6 +308,9 @@ var (
 	connectionNum    int
 	insecure         bool
 	ips              string
+	// TUN 日志文件路径（GUI 经 -tun-log 传入）：「清空日志」的截断标记靠它
+	// 定位文件。root 直写的日志 GUI 截不动，只能由内核自己 truncate。
+	tunLogPath       string
 
 	dnsServer string
 	echDomain string
@@ -355,6 +358,7 @@ func init() {
 	flag.BoolVar(&fallback, "fallback", false, "是否禁用 ECH 并回落到普通 TLS 1.3（仅 wss 模式生效，默认 false）")
 	flag.IntVar(&connectionNum, "n", 3, "每个IP建立的WebSocket连接数量")
 	flag.StringVar(&ips, "ips", "", "IP 访问策略（TUN 默认双栈；域名出口按该策略解析）\n 4: 仅IPv4\n 6: 仅IPv6\n 4,6: 域名由服务端解析时 IPv4优先\n 6,4: 域名由服务端解析时 IPv6优先")
+	flag.StringVar(&tunLogPath, "tun-log", "", "TUN 日志文件路径（GUI 传入，仅 TUN 模式）：用于响应 GUI 的清空日志标记")
 }
 
 // watchParentForExit 阻塞读 stdin，读到 EOF 就清理资源并退出。
@@ -404,6 +408,16 @@ func watchStopFile() {
 	os.Remove(stopPath)
 	for {
 		time.Sleep(500 * time.Millisecond)
+		// 清空日志标记（GUI「清空」投递）：root 直写的日志文件 GUI 截不动，
+		// 由内核自己 truncate —— stdout/stderr 是 O_APPEND，截断后的写入
+		// 自然回到新 EOF，不会错位。
+		if tunLogPath != "" {
+			marker := tunClearLogMarkerPath()
+			if _, err := os.Stat(marker); err == nil {
+				_ = os.Truncate(tunLogPath, 0)
+				_ = os.Remove(marker)
+			}
+		}
 		if _, err := os.Stat(stopPath); err == nil {
 			os.Remove(stopPath)
 			log.Printf("[TUN] 收到停止标记，正在清理资源…")
@@ -412,6 +426,15 @@ func watchStopFile() {
 			os.Exit(0)
 		}
 	}
+}
+
+// tunClearLogMarkerPath 清空日志标记路径（与 tun.stop 同目录）。
+func tunClearLogMarkerPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "/tmp/EchOS-tun.clearlog"
+	}
+	return home + "/Library/Application Support/EchOS/tun.clearlog"
 }
 
 // tunStopFilePath 停止标记文件路径（与 GUI 的 Application Support 目录一致）。
@@ -608,6 +631,18 @@ func main() {
 				EnsureEdgeHostRoutes(ranked)
 			}
 			time.Sleep(rerankInterval)
+		}
+	}()
+
+	// 预热池周期保温（2026-11-22）：TTL 60s 一过池子自然清空，空闲后的第一波
+	// 连接全部交全额建连费（0.7s+）——把 ZCode/WorkBuddy 这类预算只有
+	// 0.4~1s 的 AI 客户端直接打出"拨通即死"。这里每 10 秒补一次货：
+	// 池满时 kick 自查缺口直接返回（开销一次锁），低于上限就保持满仓。
+	// 这不是可选优化——对严预算客户端，"池子是否温热"就是"能否用"的分界线。
+	go func() {
+		for {
+			time.Sleep(10 * time.Second)
+			echPool.wsPoolKick()
 		}
 	}()
 
@@ -2921,6 +2956,16 @@ func runSOCKS5Listener(addr string) {
 	}
 }
 
+// socksOffersMethod 判断方法协商报文里是否提供了指定办法。
+func socksOffersMethod(methods []byte, want byte) bool {
+	for _, m := range methods {
+		if m == want {
+			return true
+		}
+	}
+	return false
+}
+
 func handleSOCKS5(c net.Conn, cfgp *ProxyConfig) {
 	defer c.Close()
 	_ = c.SetDeadline(time.Now().Add(cfg.DialTimeout))
@@ -2930,12 +2975,23 @@ func handleSOCKS5(c net.Conn, cfgp *ProxyConfig) {
 	}
 	methods := make([]byte, buf[1])
 	_, _ = io.ReadFull(c, methods)
+	// 按客户端实际提供的办法集选择（RFC 1928）：配置了账号密码只认 0x02，
+	// 未配置只认 0x00，都不含则回 0xFF（NO ACCEPTABLE METHODS）后断开——
+	// 之前不校验就无条件回 0x02/0x00，只发其他方法的客户端会卡死在等子协商。
 	if cfgp.Username != "" {
+		if !socksOffersMethod(methods, 0x02) {
+			_, _ = c.Write([]byte{0x05, 0xFF})
+			return
+		}
 		_, _ = c.Write([]byte{0x05, 0x02})
 		if err := handleSOCKS5UserPassAuth(c, cfgp); err != nil {
 			return
 		}
 	} else {
+		if !socksOffersMethod(methods, 0x00) {
+			_, _ = c.Write([]byte{0x05, 0xFF})
+			return
+		}
 		_, _ = c.Write([]byte{0x05, 0x00})
 	}
 
